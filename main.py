@@ -18,8 +18,8 @@ async def ask(payload: AskPayload):
             {"role": "user", "content": payload.message}
         ]
     )
-    
-    # Neues SDK: so greift man auf den Text zu
+
+    # Neues SDK: Zugriff NICHT per ["content"], sondern per .content
     answer = response.choices[0].message.content
     return {"answer": answer}
 

@@ -1,7 +1,7 @@
 fastapi
 uvicorn
 requests
-PyJWt<=2.7.0T
+python-jose
 python-dotenv
 openai>=1.12.0
 

@@ -1,6 +1,6 @@
 import json
 import requests
-import jwt
+from jose import jwt
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import openai

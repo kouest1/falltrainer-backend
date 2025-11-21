@@ -66,7 +66,7 @@ async def auth_apple(payload: AppleAuthPayload):
         decoded = jwt.decode(
             identity_token,
             key=public_key,
-            audience="YOUR_SERVICE_ID",
+            audience="com.konstantin.falltrainer.backend",
             algorithms=["RS256"]
         )
     except Exception as e:

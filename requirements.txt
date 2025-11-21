@@ -1,7 +1,6 @@
 fastapi
-uvicorn
+uvicorn[standard]
 requests
-python-jose
+python-jose[cryptography]
 python-dotenv
 openai>=1.12.0
-

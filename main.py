@@ -51,7 +51,7 @@ async def auth_apple(payload: AppleAuthPayload):
             identity_token,
             pubkey_dict,
             algorithms=["RS256"],
-            audience="com.konstantin.falltrainer.backend",
+            audience="com.konstantin.falltrainer",
             issuer="https://appleid.apple.com",
         )
     except Exception as e:

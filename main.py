@@ -79,4 +79,109 @@ async def auth_apple(payload: AppleAuthPayload):
 @app.get("/")
 def root():
     return {"message": "Backend läuft!"}
+class ReceiptPayload(BaseModel):
+    userId: str
+    receipt: str   # Base64 aus iOS
+
+class ReceiptResponse(BaseModel):
+    plan: str
+    monthlyUsage: int
+    limit: int
+
+@app.post("/validateReceipt", response_model=ReceiptResponse)
+async def validate_receipt(payload: ReceiptPayload):
+
+    user_id = payload.userId
+    receipt_data = payload.receipt
+
+    # WICHTIG: Für Tests Sandbox
+    APPLE_VERIFY_URL = "https://sandbox.itunes.apple.com/verifyReceipt"
+
+    response = requests.post(
+        APPLE_VERIFY_URL,
+        json={
+            "receipt-data": receipt_data,
+            "password": "DEIN_APP_STORE_SHARED_SECRET"
+        }
+    )
+
+    result = response.json()
+
+    if result.get("status") != 0:
+        raise HTTPException(status_code=400, detail=f"Ungültiger Receipt: {result}")
+
+    latest = result["latest_receipt_info"]
+    product_ids = {item["product_id"] for item in latest}
+
+    # Produkt → Plan Mapping
+    if "premium300" in product_ids:
+        plan = "premium"
+    elif "pro150" in product_ids:
+        plan = "pro"
+    else:
+        plan = "free"
+
+    if user_id not in dummy_users:
+        dummy_users[user_id] = {}
+
+    dummy_users[user_id]["plan"] = plan
+
+    # Limits
+    limits = {
+        "free": 6,
+        "pro": 150,
+        "premium": 300
+    }
+
+    # Falls neuer User → usage setzen
+    if "monthlyUsage" not in dummy_users[user_id]:
+        dummy_users[user_id]["monthlyUsage"] = 0
+
+    return ReceiptResponse(
+        plan=plan,
+        monthlyUsage=dummy_users[user_id]["monthlyUsage"],
+        limit=limits[plan]
+    )
+class AskPayload(BaseModel):
+    userId: str
+    message: str
+
+class AskResponse(BaseModel):
+    reply: str
+    usage: int
+    limit: int
+
+@app.post("/ask", response_model=AskResponse)
+async def ask(payload: AskPayload):
+
+    user_id = payload.userId
+    message = payload.message
+
+    if user_id not in dummy_users:
+        raise HTTPException(status_code=403, detail="User nicht gefunden")
+
+    plan = dummy_users[user_id]["plan"]
+    usage = dummy_users[user_id]["monthlyUsage"]
+
+    limits = {
+        "free": 6,
+        "pro": 150,
+        "premium": 300
+    }
+
+    limit = limits[plan]
+
+    if usage >= limit:
+        raise HTTPException(status_code=403, detail="Limit erreicht")
+
+    # KI hier einbauen (später)
+    reply = f"Antwort auf: {message}"
+
+    dummy_users[user_id]["monthlyUsage"] += 1
+
+    return AskResponse(
+        reply=reply,
+        usage=dummy_users[user_id]["monthlyUsage"],
+        limit=limit
+    )
 

@@ -1,49 +1,22 @@
 import os
 import json
-import requests
 from datetime import datetime
 
+import requests
 from jose import jwt
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
+from sqlalchemy.orm import Session
 
-from sqlalchemy import create_engine, Column, Integer, String, DateTime
-from sqlalchemy.orm import sessionmaker, declarative_base, Session
+from database import Base, engine, SessionLocal
+from models import User
+
+from openai import OpenAI
 
 # -------------------------------------------------------
-# Datenbank-Setup (Postgres über DATABASE_URL)
+# Datenbank initialisieren
 # -------------------------------------------------------
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-if not DATABASE_URL:
-    # Für lokale Tests kannst du hier z.B. eine SQLite-URL setzen
-    # DATABASE_URL = "sqlite:///./test.db"
-    raise RuntimeError("DATABASE_URL ist nicht gesetzt")
-
-engine = create_engine(DATABASE_URL, pool_pre_ping=True)
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-Base = declarative_base()
-
-
-class User(Base):
-    __tablename__ = "users"
-
-    id = Column(Integer, primary_key=True, index=True)
-    user_id = Column(String, unique=True, index=True, nullable=False)  # von Apple
-    plan = Column(String, default="free", nullable=False)              # free/pro/premium
-    monthly_usage = Column(Integer, default=0, nullable=False)
-    usage_month = Column(String, nullable=True)  # "YYYY-MM"
-
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(
-        DateTime,
-        default=datetime.utcnow,
-        onupdate=datetime.utcnow,
-        nullable=False,
-    )
-
-
-# Tabellen anlegen
 Base.metadata.create_all(bind=engine)
 
 
@@ -55,10 +28,40 @@ def get_db():
         db.close()
 
 
+# -------------------------------------------------------
+# OpenAI-Client
+# -------------------------------------------------------
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+if not OPENAI_API_KEY:
+    raise RuntimeError("OPENAI_API_KEY ist nicht gesetzt")
+
+client = OpenAI(api_key=OPENAI_API_KEY)
+
+
+def call_openai(message: str) -> str:
+    """
+    Schickt den Prompt an OpenAI und gibt NUR die Modell-Antwort zurück.
+    """
+    completion = client.chat.completions.create(
+        model="gpt-4.1-mini",  # oder dein Wunschmodell
+        messages=[
+            {"role": "user", "content": message}
+        ],
+        temperature=0.7,
+    )
+    content = completion.choices[0].message.content
+    return content or ""
+
+
+# -------------------------------------------------------
+# User + Plan Logik
+# -------------------------------------------------------
+
 PLAN_LIMITS = {
     "free": 6,
-    "pro": 150,       # Plus
-    "premium": 300,   # kannst du später auf 1000 hochsetzen
+    "pro": 150,
+    "premium": 1000,
 }
 
 
@@ -89,13 +92,17 @@ def get_limit_for_plan(plan: str) -> int:
 
 
 # -------------------------------------------------------
-# FastAPI App
+# FastAPI App & Konstanten
 # -------------------------------------------------------
 
 app = FastAPI()
 
 APPLE_KEYS_URL = "https://appleid.apple.com/auth/keys"
 
+
+# -------------------------------------------------------
+# Schemas (Pydantic)
+# -------------------------------------------------------
 
 class AppleAuthPayload(BaseModel):
     token: str  # identityToken von Apple
@@ -107,9 +114,31 @@ class AppleAuthResponse(BaseModel):
     monthlyUsage: int
 
 
-# Dummy-Datenbank (lassen wir stehen, nutzen aber DB als Wahrheit)
-dummy_users = {}
+class ReceiptPayload(BaseModel):
+    userId: str
+    receipt: str   # Base64 aus iOS
 
+
+class ReceiptResponse(BaseModel):
+    plan: str
+    monthlyUsage: int
+    limit: int
+
+
+class AskPayload(BaseModel):
+    userId: str
+    message: str
+
+
+class AskResponse(BaseModel):
+    reply: str
+    usage: int
+    limit: int
+
+
+# -------------------------------------------------------
+# Helper für Apple Public Key
+# -------------------------------------------------------
 
 def get_apple_public_key(kid: str):
     apple_keys = requests.get(APPLE_KEYS_URL).json()["keys"]
@@ -121,6 +150,16 @@ def get_apple_public_key(kid: str):
     raise Exception("Apple Public Key nicht gefunden")
 
 
+# -------------------------------------------------------
+# Endpoints
+# -------------------------------------------------------
+
+@app.get("/")
+def root():
+    return {"message": "Backend läuft!"}
+
+
+# 1) Login mit Apple
 @app.post("/auth/apple", response_model=AppleAuthResponse)
 async def auth_apple(payload: AppleAuthPayload, db: Session = Depends(get_db)):
     identity_token = payload.token
@@ -146,17 +185,11 @@ async def auth_apple(payload: AppleAuthPayload, db: Session = Depends(get_db)):
 
     apple_user_id = decoded["sub"]
 
-    # Falls neuer User -> anlegen (in richtiger DB)
+    # User aus DB holen/anlegen
     user = get_or_create_user(db, apple_user_id)
     apply_month_reset(user)
     db.commit()
     db.refresh(user)
-
-    # Dummy-Map parallel aktualisieren (kann später weg)
-    dummy_users[apple_user_id] = {
-        "plan": user.plan,
-        "monthlyUsage": user.monthly_usage,
-    }
 
     return AppleAuthResponse(
         userId=apple_user_id,
@@ -165,36 +198,21 @@ async def auth_apple(payload: AppleAuthPayload, db: Session = Depends(get_db)):
     )
 
 
-@app.get("/")
-def root():
-    return {"message": "Backend läuft!"}
-
-
-class ReceiptPayload(BaseModel):
-    userId: str
-    receipt: str   # Base64 aus iOS
-
-
-class ReceiptResponse(BaseModel):
-    plan: str
-    monthlyUsage: int
-    limit: int
-
-
+# 2) Receipt validieren (Abo)
 @app.post("/validateReceipt", response_model=ReceiptResponse)
 async def validate_receipt(payload: ReceiptPayload, db: Session = Depends(get_db)):
     user_id = payload.userId
     receipt_data = payload.receipt
 
-    # WICHTIG: Für Tests Sandbox
+    # Sandbox-Endpoint für Tests
     APPLE_VERIFY_URL = "https://sandbox.itunes.apple.com/verifyReceipt"
 
     response = requests.post(
         APPLE_VERIFY_URL,
         json={
             "receipt-data": receipt_data,
-            "password": "DEIN_APP_STORE_SHARED_SECRET",
-        }
+            "password": "DEIN_APP_STORE_SHARED_SECRET",  # TODO: ersetzen
+        },
     )
 
     result = response.json()
@@ -205,8 +223,7 @@ async def validate_receipt(payload: ReceiptPayload, db: Session = Depends(get_db
     latest = result["latest_receipt_info"]
     product_ids = {item["product_id"] for item in latest}
 
-    # Produkt → Plan Mapping (an deine Produkt-IDs anpassen!)
-    # Beispiel: Plus150, Premium1000
+    # Produkt-ID → Plan Mapping (an deine IDs angepasst)
     if "Premium1000" in product_ids:
         plan = "premium"
     elif "Plus150" in product_ids:
@@ -214,48 +231,29 @@ async def validate_receipt(payload: ReceiptPayload, db: Session = Depends(get_db
     else:
         plan = "free"
 
-    # User in richtiger DB holen / anlegen
-    db_user = get_or_create_user(db, user_id)
-    db_user.plan = plan
-    # Optional: bei Planwechsel Usage zurücksetzen
-    db_user.monthly_usage = 0
-    db_user.usage_month = datetime.utcnow().strftime("%Y-%m")
-    db.commit()
-    db.refresh(db_user)
+    user = get_or_create_user(db, user_id)
+    user.plan = plan
+    user.monthly_usage = 0
+    user.usage_month = datetime.utcnow().strftime("%Y-%m")
 
-    # Dummy-Map synchron halten
-    if user_id not in dummy_users:
-        dummy_users[user_id] = {}
-    dummy_users[user_id]["plan"] = plan
-    if "monthlyUsage" not in dummy_users[user_id]:
-        dummy_users[user_id]["monthlyUsage"] = 0
+    db.commit()
+    db.refresh(user)
 
     limit = get_limit_for_plan(plan)
 
     return ReceiptResponse(
         plan=plan,
-        monthlyUsage=db_user.monthly_usage,
+        monthlyUsage=user.monthly_usage,
         limit=limit,
     )
 
 
-class AskPayload(BaseModel):
-    userId: str
-    message: str
-
-
-class AskResponse(BaseModel):
-    reply: str
-    usage: int
-    limit: int
-
-
+# 3) KI-Frage stellen (mit Limit)
 @app.post("/ask", response_model=AskResponse)
 async def ask(payload: AskPayload, db: Session = Depends(get_db)):
     user_id = payload.userId
     message = payload.message
 
-    # User aus richtiger DB holen / anlegen
     user = get_or_create_user(db, user_id)
     apply_month_reset(user)
 
@@ -266,19 +264,16 @@ async def ask(payload: AskPayload, db: Session = Depends(get_db)):
     if usage >= limit:
         raise HTTPException(status_code=403, detail="Limit erreicht")
 
-    # KI hier einbauen (später) – aktuell Dummy-Reply
-    reply = f"Antwort auf: {message}"
+    # KI anfragen
+    try:
+        reply = call_openai(message)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Fehler bei KI-Anfrage: {e}")
 
     # Usage hochzählen
     user.monthly_usage += 1
     db.commit()
     db.refresh(user)
-
-    # Dummy-Map optional aktualisieren
-    dummy_users[user_id] = {
-        "plan": user.plan,
-        "monthlyUsage": user.monthly_usage,
-    }
 
     return AskResponse(
         reply=reply,

@@ -7,11 +7,10 @@ from jose import jwt
 from fastapi import FastAPI, HTTPException, Depends
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from openai import OpenAI
 
 from database import Base, engine, SessionLocal
 from models import User
-
-from openai import OpenAI
 
 # -------------------------------------------------------
 # Datenbank initialisieren
@@ -38,13 +37,45 @@ if not OPENAI_API_KEY:
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
+# Plan-Konfiguration: Limit + Modell
+PLAN_CONFIG = {
+    "free": {
+        "limit": 6,
+        # Platzhalter – in Render über OPENAI_MODEL_FREE überschreibbar
+        "model": os.getenv("OPENAI_MODEL_FREE", "gpt-4.5"),
+    },
+    "pro": {
+        "limit": 300,
+        "model": os.getenv("OPENAI_MODEL_PRO", "gpt-5-mini"),
+    },
+    "premium": {
+        "limit": 300,
+        "model": os.getenv("OPENAI_MODEL_PREMIUM", "gpt-5.1"),
+    },
+}
 
-def call_openai(message: str) -> str:
+
+def current_month_str() -> str:
+    """z.B. '2025-11' – so speichern wir die Nutzung pro Monat."""
+    return datetime.utcnow().strftime("%Y-%m")
+
+
+def get_limit_for_plan(plan: str) -> int:
+    cfg = PLAN_CONFIG.get(plan, PLAN_CONFIG["free"])
+    return cfg["limit"]
+
+
+def get_model_for_plan(plan: str) -> str:
+    cfg = PLAN_CONFIG.get(plan, PLAN_CONFIG["free"])
+    return cfg["model"]
+
+
+def call_openai(message: str, model_name: str) -> str:
     """
     Schickt den Prompt an OpenAI und gibt NUR die Modell-Antwort zurück.
     """
     completion = client.chat.completions.create(
-        model="gpt-4.1-mini",  # oder dein Wunschmodell
+        model=model_name,
         messages=[
             {"role": "user", "content": message}
         ],
@@ -57,13 +88,6 @@ def call_openai(message: str) -> str:
 # -------------------------------------------------------
 # User + Plan Logik
 # -------------------------------------------------------
-
-PLAN_LIMITS = {
-    "free": 6,
-    "pro": 150,
-    "premium": 1000,
-}
-
 
 def get_or_create_user(db: Session, user_id: str) -> User:
     user = db.query(User).filter(User.user_id == user_id).first()
@@ -81,14 +105,10 @@ def get_or_create_user(db: Session, user_id: str) -> User:
 
 
 def apply_month_reset(user: User):
-    now_month = datetime.utcnow().strftime("%Y-%m")
+    now_month = current_month_str()
     if user.usage_month != now_month:
         user.usage_month = now_month
         user.monthly_usage = 0
-
-
-def get_limit_for_plan(plan: str) -> int:
-    return PLAN_LIMITS.get(plan, PLAN_LIMITS["free"])
 
 
 # -------------------------------------------------------
@@ -211,7 +231,7 @@ async def validate_receipt(payload: ReceiptPayload, db: Session = Depends(get_db
         APPLE_VERIFY_URL,
         json={
             "receipt-data": receipt_data,
-            "password": "DEIN_APP_STORE_SHARED_SECRET",  # TODO: ersetzen
+            "password": "DEIN_APP_STORE_SHARED_SECRET",  # TODO: echtes Shared Secret
         },
     )
 
@@ -234,7 +254,7 @@ async def validate_receipt(payload: ReceiptPayload, db: Session = Depends(get_db
     user = get_or_create_user(db, user_id)
     user.plan = plan
     user.monthly_usage = 0
-    user.usage_month = datetime.utcnow().strftime("%Y-%m")
+    user.usage_month = current_month_str()
 
     db.commit()
     db.refresh(user)
@@ -248,7 +268,7 @@ async def validate_receipt(payload: ReceiptPayload, db: Session = Depends(get_db
     )
 
 
-# 3) KI-Frage stellen (mit Limit)
+# 3) KI-Frage stellen (mit Limit + Plan-spezifischem Modell)
 @app.post("/ask", response_model=AskResponse)
 async def ask(payload: AskPayload, db: Session = Depends(get_db)):
     user_id = payload.userId
@@ -260,13 +280,15 @@ async def ask(payload: AskPayload, db: Session = Depends(get_db)):
     plan = user.plan
     usage = user.monthly_usage
     limit = get_limit_for_plan(plan)
+    model_name = get_model_for_plan(plan)
 
+    # Limit prüfen
     if usage >= limit:
         raise HTTPException(status_code=403, detail="Limit erreicht")
 
     # KI anfragen
     try:
-        reply = call_openai(message)
+        reply = call_openai(message, model_name=model_name)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Fehler bei KI-Anfrage: {e}")
 

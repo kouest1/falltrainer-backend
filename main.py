@@ -155,6 +155,14 @@ class AskResponse(BaseModel):
     usage: int
     limit: int
 
+class ExcludedCasesPayload(BaseModel):
+    userId: str
+    excludedIds: list[str]
+
+
+class ExcludedCasesResponse(BaseModel):
+    excludedIds: list[str]
+
 
 # -------------------------------------------------------
 # Helper für Apple Public Key
@@ -302,4 +310,44 @@ async def ask(payload: AskPayload, db: Session = Depends(get_db)):
         usage=user.monthly_usage,
         limit=limit,
     )
+
+# 4) Erledigte / ausgeschlossene Fälle LADEN
+@app.post("/user/excluded/load", response_model=ExcludedCasesResponse)
+async def load_excluded_cases(
+    payload: ExcludedCasesPayload,
+    db: Session = Depends(get_db),
+):
+    # User holen/anlegen
+    user = get_or_create_user(db, payload.userId)
+
+    # JSON aus der DB lesen
+    if user.excluded_cases:
+        try:
+            ids = json.loads(user.excluded_cases)
+        except Exception:
+            ids = []
+    else:
+        ids = []
+
+    # sicherstellen, dass wir Strings zurückgeben
+    ids = [str(x) for x in ids]
+
+    return ExcludedCasesResponse(excludedIds=ids)
+
+
+# 5) Erledigte / ausgeschlossene Fälle SPEICHERN
+@app.post("/user/excluded/save", response_model=ExcludedCasesResponse)
+async def save_excluded_cases(
+    payload: ExcludedCasesPayload,
+    db: Session = Depends(get_db),
+):
+    # User holen/anlegen
+    user = get_or_create_user(db, payload.userId)
+
+    # Liste aus dem Payload nehmen und als JSON sichern
+    user.excluded_cases = json.dumps(payload.excludedIds)
+    db.commit()
+    db.refresh(user)
+
+    return ExcludedCasesResponse(excludedIds=payload.excludedIds)
 

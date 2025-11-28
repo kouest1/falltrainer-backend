@@ -20,8 +20,11 @@ class User(Base):
     # Welcher Monat gezählt wird (Format "YYYY-MM", z.B. "2025-11")
     usage_month = Column(String, nullable=True)
 
-    # NEU: Liste erledigter/ausgeschlossener Fälle als JSON-Text (z.B. '["UUID1","UUID2"]')
+    # Liste erledigter/ausgeschlossener Fälle als JSON-Text (z.B. '["UUID1","UUID2"]')
     excluded_cases = Column(Text, nullable=True)
+
+    # NEU: Notizen pro Fall als JSON-Text (z.B. '{"caseId":"Meine Notiz"}')
+    notes = Column(Text, nullable=True)
 
     # Timestamps
     created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
@@ -31,4 +34,3 @@ class User(Base):
         onupdate=datetime.utcnow,
         nullable=False,
     )
-

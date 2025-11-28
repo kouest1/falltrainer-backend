@@ -97,6 +97,8 @@ def get_or_create_user(db: Session, user_id: str) -> User:
             plan="free",
             monthly_usage=0,
             usage_month=None,
+            excluded_cases=None,
+            notes=None,
         )
         db.add(user)
         db.commit()
@@ -155,6 +157,7 @@ class AskResponse(BaseModel):
     usage: int
     limit: int
 
+
 class ExcludedCasesPayload(BaseModel):
     userId: str
     excludedIds: list[str]
@@ -162,6 +165,22 @@ class ExcludedCasesPayload(BaseModel):
 
 class ExcludedCasesResponse(BaseModel):
     excludedIds: list[str]
+
+
+# ---------- NEU: Notizen-Schemas ----------
+
+class NotesLoadPayload(BaseModel):
+    userId: str
+
+
+class NoteUpdatePayload(BaseModel):
+    userId: str
+    caseId: str   # UUID-String des Falls
+    note: str     # kompletter Text der Notiz
+
+
+class NotesResponse(BaseModel):
+    notes: dict[str, str]  # { "caseId": "Notiztext", ... }
 
 
 # -------------------------------------------------------
@@ -311,6 +330,7 @@ async def ask(payload: AskPayload, db: Session = Depends(get_db)):
         limit=limit,
     )
 
+
 # 4) Erledigte / ausgeschlossene Fälle LADEN
 @app.post("/user/excluded/load", response_model=ExcludedCasesResponse)
 async def load_excluded_cases(
@@ -350,4 +370,69 @@ async def save_excluded_cases(
     db.refresh(user)
 
     return ExcludedCasesResponse(excludedIds=payload.excludedIds)
+
+
+# 6) Notizen LADEN
+@app.post("/user/notes/load", response_model=NotesResponse)
+async def load_notes(
+    payload: NotesLoadPayload,
+    db: Session = Depends(get_db),
+):
+    user = get_or_create_user(db, payload.userId)
+
+    if user.notes:
+        try:
+            notes = json.loads(user.notes)
+        except Exception:
+            notes = {}
+    else:
+        notes = {}
+
+    # Fallback, falls irgendwas anderes drinsteht
+    if not isinstance(notes, dict):
+        notes = {}
+
+    # Keys & Values sicher als Strings
+    clean_notes: dict[str, str] = {}
+    for k, v in notes.items():
+        clean_notes[str(k)] = str(v)
+
+    return NotesResponse(notes=clean_notes)
+
+
+# 7) Notizen SPEICHERN / aktualisieren
+@app.post("/user/notes/save", response_model=NotesResponse)
+async def save_note(
+    payload: NoteUpdatePayload,
+    db: Session = Depends(get_db),
+):
+    user = get_or_create_user(db, payload.userId)
+
+    if user.notes:
+        try:
+            notes = json.loads(user.notes)
+        except Exception:
+            notes = {}
+    else:
+        notes = {}
+
+    if not isinstance(notes, dict):
+        notes = {}
+
+    # leere Notiz = löschen
+    if payload.note.strip() == "":
+        notes.pop(payload.caseId, None)
+    else:
+        notes[payload.caseId] = payload.note
+
+    user.notes = json.dumps(notes)
+    db.commit()
+    db.refresh(user)
+
+    # wieder aufräumen und zurückgeben
+    clean_notes: dict[str, str] = {}
+    for k, v in notes.items():
+        clean_notes[str(k)] = str(v)
+
+    return NotesResponse(notes=clean_notes)
 

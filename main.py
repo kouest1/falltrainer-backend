@@ -79,7 +79,7 @@ def call_openai(message: str, model_name: str) -> str:
         messages=[
             {"role": "user", "content": message}
         ],
-        temperature=0.7,
+        temperature=1,
     )
     content = completion.choices[0].message.content
     return content or ""

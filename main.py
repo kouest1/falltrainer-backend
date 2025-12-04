@@ -182,6 +182,23 @@ class NoteUpdatePayload(BaseModel):
 class NotesResponse(BaseModel):
     notes: dict[str, str]  # { "caseId": "Notiztext", ... }
 
+from pydantic import BaseModel
+from typing import List, Literal, Optional
+
+class DuoMessage(BaseModel):
+    role: Literal["doctor", "patient"]
+    content: str
+
+class DuoChatRequest(BaseModel):
+    userId: str
+    caseTitle: str
+    caseDescription: str
+    messages: List[DuoMessage]
+
+class DuoChatResponse(BaseModel):
+    reply: str
+    usage: Optional[int] = None   # falls du Usage/Limits mitschicken willst
+
 
 # -------------------------------------------------------
 # Helper für Apple Public Key
@@ -435,4 +452,53 @@ async def save_note(
         clean_notes[str(k)] = str(v)
 
     return NotesResponse(notes=clean_notes)
+
+@app.post("/duoChat", response_model=DuoChatResponse)
+async def duo_chat(req: DuoChatRequest):
+    """
+    Spielt den Patienten im Arzt/Patienten-Duo-Modus.
+    iOS schickt: userId, caseTitle, caseDescription, messages[role, content]
+    """
+
+    # TODO: Hier könntest du genauso wie bei /ask dein Limit / Plan prüfen.
+    # z.B. user = get_user(req.userId), usage-check etc.
+
+    # 1) System-Prompt bauen
+    system_prompt = (
+        "Du spielst in einem Rollenspiel einen Patienten. "
+        "Der Arzt ist der Benutzer. Antworte immer in der Ich-Form, "
+        "so wie ein echter Patient sprechen würde, kurz und präzise.\n\n"
+        f"Falltitel: {req.caseTitle}\n\n"
+        f"Fallbeschreibung:\n{req.caseDescription}\n\n"
+        "Benutze nur Informationen, die zu diesem Fall passen. "
+        "Wenn der Arzt Dinge fragt, die nicht zum Fall gehören, "
+        "antworte höflich, aber bleib beim Fall."
+    )
+
+    # 2) Verlauf in Chat-Format bringen (für dein KI-Modell)
+    chat_messages = [
+        {"role": "system", "content": system_prompt}
+    ]
+
+    for msg in req.messages:
+        if msg.role == "doctor":
+            chat_messages.append({"role": "user", "content": msg.content})
+        else:
+            chat_messages.append({"role": "assistant", "content": msg.content})
+
+    # 3) KI aufrufen
+    #
+    # Hier musst du deine eigene Logik einsetzen – z.B. so ähnlich wie bei /ask.
+    # Zum Testen erstmal ein Dummy:
+
+    if req.messages:
+        last = req.messages[-1].content
+    else:
+        last = "—"
+
+    reply_text = f"Ich beantworte Ihre Frage: '{last}'. Hier würde später die echte KI-Antwort stehen."
+    new_usage: int | None = None  # wenn du Usage trackst, hier setzen
+
+    # 4) Antwort zurückgeben
+    return DuoChatResponse(reply=reply_text, usage=new_usage)
 

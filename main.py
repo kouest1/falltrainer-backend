@@ -520,4 +520,60 @@ async def duo_chat(req: DuoChatRequest):
             reply="Entschuldigung, ich kann gerade nicht gut antworten – es gab einen technischen Fehler.",
             usage=None,
         )
+@app.post("/duoDoctorChat", response_model=DuoChatResponse)
+async def duo_doctor_chat(req: DuoChatRequest):
+    """
+    Coaching für die Arzt-Rolle im Duo-Modus.
+    iOS schickt: userId, caseTitle, caseDescription, messages[role, content]
+    """
+
+    system_prompt = (
+        "Du bist ein erfahrener Neurologe und Lehrarzt. "
+        "Du siehst den Dialog zwischen einem Patienten und einem Assistenzarzt.\n"
+        "Der Assistenzarzt tippt ein, was der Patient sagt. "
+        "Deine Aufgabe ist, knappe, konkrete Vorschläge zu machen:\n"
+        "- Welche Frage sollte der Arzt als nächstes stellen?\n"
+        "- Welche körperliche Untersuchung oder Zusatzdiagnostik bietet sich an?\n"
+        "Antworte in 1–3 kurzen Sätzen auf Deutsch, als Vorschlag an den Arzt.\n\n"
+        f"Falltitel: {req.caseTitle}\n\n"
+        f"Fallbeschreibung (medizinischer Hintergrund):\n{req.caseDescription}\n"
+    )
+
+    # bisherigen Verlauf in Textform
+    lines = []
+    for msg in req.messages:
+        if msg.role == "patient":
+            lines.append(f"Patient: {msg.content}")
+        else:
+            lines.append(f"Arzt-Coach: {msg.content}")
+    conversation_text = "\n".join(lines) if lines else "Noch keine Aussagen."
+
+    prompt = (
+        system_prompt
+        + "\n\nBisheriger Dialog:\n"
+        + conversation_text
+        + "\n\nDein nächster Vorschlag an den Arzt:"
+    )
+
+    model_name = PLAN_CONFIG.get("free", {}).get("model") or "gpt-4.5-mini"
+
+    try:
+        resp = client.responses.create(
+            model=model_name,
+            input=prompt,
+        )
+
+        try:
+            reply_text = resp.output[0].content[0].text
+        except Exception:
+            reply_text = getattr(resp, "output_text", str(resp))
+
+        return DuoChatResponse(reply=reply_text.strip(), usage=None)
+
+    except Exception as e:
+        print("Fehler in /duoDoctorChat:", repr(e))
+        return DuoChatResponse(
+            reply="Ich kann gerade keine sinnvollen Vorschläge machen – es gab einen technischen Fehler.",
+            usage=None,
+        )
 

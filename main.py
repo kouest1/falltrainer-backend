@@ -460,45 +460,67 @@ async def duo_chat(req: DuoChatRequest):
     iOS schickt: userId, caseTitle, caseDescription, messages[role, content]
     """
 
-    # TODO: Hier könntest du genauso wie bei /ask dein Limit / Plan prüfen.
-    # z.B. user = get_user(req.userId), usage-check etc.
+    # TODO (optional): hier könntest du wie bei /ask Limits / Plan prüfen,
+    # falls du das für den Duo-Modus auch möchtest.
 
-    # 1) System-Prompt bauen
+    # 1) System-Prompt: Rolle + Fallkontext
     system_prompt = (
-        "Du spielst in einem Rollenspiel einen Patienten. "
-        "Der Arzt ist der Benutzer. Antworte immer in der Ich-Form, "
-        "so wie ein echter Patient sprechen würde, kurz und präzise.\n\n"
+        "Du spielst in einem Rollenspiel einen Patienten in einer "
+        "neurologischen Sprechstunde. Der Arzt ist der Benutzer.\n"
+        "Antworte IMMER in der Ich-Form, so wie ein echter Patient "
+        "sprechen würde. Antworte kurz, präzise und in natürlichem "
+        "Deutsch. Verzichte auf medizinische Fachbegriffe, außer der "
+        "Arzt verwendet sie ausdrücklich.\n\n"
         f"Falltitel: {req.caseTitle}\n\n"
-        f"Fallbeschreibung:\n{req.caseDescription}\n\n"
+        f"Fallbeschreibung (medizinischer Hintergrund):\n{req.caseDescription}\n\n"
         "Benutze nur Informationen, die zu diesem Fall passen. "
-        "Wenn der Arzt Dinge fragt, die nicht zum Fall gehören, "
-        "antworte höflich, aber bleib beim Fall."
+        "Wenn der Arzt Dinge fragt, die nicht zum Fall gehören oder "
+        "Informationen verlangt, die im Fall nicht vorhanden sind, "
+        "antworte höflich, dass du das nicht genau weißt oder dich "
+        "nicht erinnern kannst.\n"
     )
 
-    # 2) Verlauf in Chat-Format bringen (für dein KI-Modell)
-    chat_messages = [
+    # 2) Verlauf in OpenAI-Chatformat bringen
+    messages_for_model: list[dict[str, str]] = [
         {"role": "system", "content": system_prompt}
     ]
 
     for msg in req.messages:
         if msg.role == "doctor":
-            chat_messages.append({"role": "user", "content": msg.content})
+            messages_for_model.append({
+                "role": "user",
+                "content": msg.content
+            })
         else:
-            chat_messages.append({"role": "assistant", "content": msg.content})
+            messages_for_model.append({
+                "role": "assistant",
+                "content": msg.content
+            })
 
-    # 3) KI aufrufen
-    #
-    # Hier musst du deine eigene Logik einsetzen – z.B. so ähnlich wie bei /ask.
-    # Zum Testen erstmal ein Dummy:
+    # 3) OpenAI aufrufen
+    try:
+        completion = await client.chat.completions.create(
+            model="gpt-4o-mini",   # oder dein Wunschmodell
+            messages=messages_for_model,
+            temperature=0.7,
+            max_tokens=200
+        )
 
-    if req.messages:
-        last = req.messages[-1].content
-    else:
-        last = "—"
+        reply_text = (completion.choices[0].message.content or "").strip()
 
-    reply_text = f"Ich beantworte Ihre Frage: '{last}'. Hier würde später die echte KI-Antwort stehen."
-    new_usage: int | None = None  # wenn du Usage trackst, hier setzen
+        # Wenn du hier usage/Limits tracken willst, kannst du die Token auslesen:
+        # usage_total = completion.usage.total_tokens
+        # new_usage = ...  # in DB/User speichern etc.
+        new_usage: int | None = None
 
-    # 4) Antwort zurückgeben
-    return DuoChatResponse(reply=reply_text, usage=new_usage)
+        return DuoChatResponse(reply=reply_text, usage=new_usage)
+
+    except Exception as e:
+        # Logging, damit du auf Render siehst, was los ist
+        print("Fehler in /duoChat:", repr(e))
+        # Fallback: lieber irgendwas Sinnvolles zurückgeben als 500
+        return DuoChatResponse(
+            reply="Entschuldigung, ich kann gerade nicht gut antworten – es gab einen technischen Fehler.",
+            usage=None
+        )
 

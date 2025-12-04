@@ -452,16 +452,12 @@ async def save_note(
         clean_notes[str(k)] = str(v)
 
     return NotesResponse(notes=clean_notes)
-
 @app.post("/duoChat", response_model=DuoChatResponse)
 async def duo_chat(req: DuoChatRequest):
     """
     Spielt den Patienten im Arzt/Patienten-Duo-Modus.
     iOS schickt: userId, caseTitle, caseDescription, messages[role, content]
     """
-
-    # TODO (optional): hier könntest du wie bei /ask Limits / Plan prüfen,
-    # falls du das für den Duo-Modus auch möchtest.
 
     # 1) System-Prompt: Rolle + Fallkontext
     system_prompt = (
@@ -480,47 +476,48 @@ async def duo_chat(req: DuoChatRequest):
         "nicht erinnern kannst.\n"
     )
 
-    # 2) Verlauf in OpenAI-Chatformat bringen
-    messages_for_model: list[dict[str, str]] = [
-        {"role": "system", "content": system_prompt}
-    ]
-
+    # 2) bisherigen Dialog in Text gießen
+    convo_lines = []
     for msg in req.messages:
-        if msg.role == "doctor":
-            messages_for_model.append({
-                "role": "user",
-                "content": msg.content
-            })
-        else:
-            messages_for_model.append({
-                "role": "assistant",
-                "content": msg.content
-            })
+        sprecher = "Arzt" if msg.role == "doctor" else "Patient"
+        convo_lines.append(f"{sprecher}: {msg.content}")
+    conversation_text = "\n".join(convo_lines) if convo_lines else "– noch kein Dialog –"
 
-    # 3) OpenAI aufrufen
+    prompt = (
+        system_prompt
+        + "\n\nBisheriger Dialog zwischen Arzt und Patient:\n"
+        + conversation_text
+        + "\n\nAntwort des Patienten (ein kurzer, natürlicher Satz):"
+    )
+
+    # 3) Modell wählen – wie bei dir im PLAN_CONFIG
+    model_name = PLAN_CONFIG.get("free", {}).get("model") or "gpt-4.5-mini"
+
     try:
-        completion = await client.chat.completions.create(
-            model="gpt-4o-mini",   # oder dein Wunschmodell
-            messages=messages_for_model,
-            temperature=0.7,
-            max_tokens=200
+        # SYNCHRONER Call – KEIN await, weil client = OpenAI(...)
+        resp = client.responses.create(
+            model=model_name,
+            input=prompt,
         )
 
-        reply_text = (completion.choices[0].message.content or "").strip()
+        # Text aus der Response holen – gleiche Logik wie bei deinem /ask
+        try:
+            # übliche Struktur der Responses-API
+            reply_text = resp.output[0].content[0].text
+        except Exception:
+            # Fallback, falls du ein anderes Format verwendest
+            reply_text = getattr(resp, "output_text", str(resp))
 
-        # Wenn du hier usage/Limits tracken willst, kannst du die Token auslesen:
-        # usage_total = completion.usage.total_tokens
-        # new_usage = ...  # in DB/User speichern etc.
-        new_usage: int | None = None
+        # Hier könntest du optional usage auswerten, wenn du willst:
+        # new_usage = resp.usage.total_tokens  # oder etwas Ähnliches
+        new_usage = None
 
-        return DuoChatResponse(reply=reply_text, usage=new_usage)
+        return DuoChatResponse(reply=reply_text.strip(), usage=new_usage)
 
     except Exception as e:
-        # Logging, damit du auf Render siehst, was los ist
         print("Fehler in /duoChat:", repr(e))
-        # Fallback: lieber irgendwas Sinnvolles zurückgeben als 500
         return DuoChatResponse(
             reply="Entschuldigung, ich kann gerade nicht gut antworten – es gab einen technischen Fehler.",
-            usage=None
+            usage=None,
         )
 

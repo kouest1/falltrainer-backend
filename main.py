@@ -461,7 +461,6 @@ async def duo_chat(req: DuoChatRequest):
 
     # 1) System-Prompt: Rolle + Fallkontext
     system_prompt = (
-system_prompt = (
     "Du bist ein SIMULIERTER PATIENT in einem neurologischen Trainings-Chat (Anamnese + Untersuchung).\n"
     "Der Benutzer ist der Arzt. Du kennst die Fallbeschreibung als Ground Truth, der Arzt nicht.\n\n"
     "HARTER RAHMEN\n"

@@ -500,7 +500,7 @@ async def save_note(
     for k, v in notes.items():
         clean_notes[str(k)] = str(v)
 
-return NotesResponse(notes=clean_notes)
+    return NotesResponse(notes=clean_notes)
 
 
 @app.post("/duoChat", response_model=DuoChatResponse)

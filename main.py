@@ -196,7 +196,8 @@ class DuoChatRequest(BaseModel):
 
 class DuoChatResponse(BaseModel):
     reply: str
-    usage: Optional[int] = None   # falls du Usage/Limits mitschicken willst
+    usage: Optional[int] = None
+    limit: Optional[int] = None
 
 class TransactionPayload(BaseModel):
     userId: str
@@ -499,94 +500,122 @@ async def save_note(
     for k, v in notes.items():
         clean_notes[str(k)] = str(v)
 
-    return NotesResponse(notes=clean_notes)
+return NotesResponse(notes=clean_notes)
+
+
 @app.post("/duoChat", response_model=DuoChatResponse)
-async def duo_chat(req: DuoChatRequest):
+async def duo_chat(req: DuoChatRequest, db: Session = Depends(get_db)):
     """
     Spielt den Patienten im Arzt/Patienten-Duo-Modus.
     iOS schickt: userId, caseTitle, caseDescription, messages[role, content]
     """
 
+    # --- Plan/Limits wie bei /ask ---
+    user = get_or_create_user(db, req.userId)
+    apply_month_reset(user)
+
+    plan = user.plan
+    limit = get_limit_for_plan(plan)
+
+    if user.monthly_usage >= limit:
+        raise HTTPException(status_code=403, detail="Limit erreicht")
+
+    model_name = get_model_for_plan(plan)
+
     # 1) System-Prompt: Rolle + Fallkontext
     system_prompt = (
-    "Du bist ein SIMULIERTER PATIENT in einem neurologischen Trainings-Chat (Anamnese + Untersuchung).\n"
-    "Der Benutzer ist der Arzt. Du kennst die Fallbeschreibung als Ground Truth, der Arzt nicht.\n\n"
-    "HARTER RAHMEN\n"
-    "- Du bist medizinischer Laie: keine Fachbegriffe, keine Diagnosen, keine Erklaerungen. Fachbegriffe aus dem Falltext immer in Alltagssprache uebersetzen.\n"
-    "- Nutze nur Infos aus der Fallbeschreibung. Nichts erfinden.\n"
-    "- Wenn der Arzt etwas fragt, was nicht im Falltext steht oder noch nicht erhoben wurde: sage ehrlich, dass du das nicht weisst / nicht beurteilen kannst / dass es nicht untersucht wurde.\n"
-    "- Keine Labor/CT/MRT/EEG/LP-Ergebnisse nennen, ausser sie stehen im Falltext oder wurden angeordnet UND sind im Falltext vorhanden.\n\n"
-    "ANTWORTSTIL\n"
-    "- Ich-Form, hoeflich, menschlich, eher kurz (1bis4 Saetze).\n"
-    "- Pro Nachricht nur neue relevante Infos, die der Arzt erfragt hat. Keine ungefragten Info-Dumps.\n"
-    "- Mehrere Fragen: der Reihe nach kurz beantworten.\n"
-    "- Unklare Fachwoerter: freundlich nachfragen, z.B. \"Was meinen Sie genau?\"\n\n"
-    "UNTERSUCHUNG\n"
-    "- Bei Untersuchungsanordnungen reagierst du wie ein Patient (Kooperation, subjektive Eindruecke), ausser im Falltext steht, dass du nicht kooperierst.\n"
-    "- Objektive Befunde nur nennen, wenn sie im Falltext stehen.\n\n"
-    f"Falltitel: {req.caseTitle}\n\n"
-    f"Fallbeschreibung (Ground Truth):\n{req.caseDescription}\n\n"
-    "Antworte als Patient nur auf die letzte Arztnachricht."
-)
-    # 2) bisherigen Dialog in Text gießen
+        "Du bist ein SIMULIERTER PATIENT in einem neurologischen Trainings-Chat (Anamnese + Untersuchung).\n"
+        "Der Benutzer ist der Arzt. Du kennst die Fallbeschreibung als Ground Truth, der Arzt nicht.\n\n"
+        "HARTER RAHMEN\n"
+        "- Du bist medizinischer Laie: keine Fachbegriffe, keine Diagnosen, keine Erklaerungen. Fachbegriffe aus dem Falltext immer in Alltagssprache uebersetzen.\n"
+        "- Nutze nur Infos aus der Fallbeschreibung. Nichts erfinden.\n"
+        "- Wenn der Arzt etwas fragt, was nicht im Falltext steht oder noch nicht erhoben wurde: sage ehrlich, dass du das nicht weisst / nicht beurteilen kannst / dass es nicht untersucht wurde.\n"
+        "- Keine Labor/CT/MRT/EEG/LP-Ergebnisse nennen, ausser sie stehen im Falltext oder wurden angeordnet UND sind im Falltext vorhanden.\n\n"
+        "ANTWORTSTIL\n"
+        "- Ich-Form, hoeflich, menschlich, eher kurz (1-4 Saetze).\n"
+        "- Pro Nachricht nur neue relevante Infos, die der Arzt erfragt hat. Keine ungefragten Info-Dumps.\n"
+        "- Mehrere Fragen: der Reihe nach kurz beantworten.\n"
+        "- Unklare Fachwoerter: freundlich nachfragen, z.B. \"Was meinen Sie genau?\"\n\n"
+        "UNTERSUCHUNG\n"
+        "- Bei Untersuchungsanordnungen reagierst du wie ein Patient (Kooperation, subjektive Eindruecke), ausser im Falltext steht, dass du nicht kooperierst.\n"
+        "- Objektive Befunde nur nennen, wenn sie im Falltext stehen.\n\n"
+        f"Falltitel: {req.caseTitle}\n\n"
+        f"Fallbeschreibung (Ground Truth):\n{req.caseDescription}\n\n"
+        "Antworte als Patient nur auf die letzte Arztnachricht."
+    )
+
+    # 2) bisherigen Dialog in Text giessen
     convo_lines = []
     for msg in req.messages:
         sprecher = "Arzt" if msg.role == "doctor" else "Patient"
         convo_lines.append(f"{sprecher}: {msg.content}")
-    conversation_text = "\n".join(convo_lines) if convo_lines else "– noch kein Dialog –"
+    conversation_text = "\n".join(convo_lines) if convo_lines else "(noch kein Dialog)"
 
     prompt = (
         system_prompt
         + "\n\nBisheriger Dialog zwischen Arzt und Patient:\n"
         + conversation_text
-        + "\n\nAntwort des Patienten (ein kurzer, natürlicher Satz):"
+        + "\n\nAntwort des Patienten (kurz und alltagssprachlich):"
     )
 
-    # 3) Modell wählen – wie bei dir im PLAN_CONFIG
-    model_name = PLAN_CONFIG.get("free", {}).get("model") or "gpt-4.5-mini"
-
     try:
-        # SYNCHRONER Call – KEIN await, weil client = OpenAI(...)
+        # SYNCHRONER Call (client = OpenAI(...))
         resp = client.responses.create(
             model=model_name,
             input=prompt,
         )
 
-        # Text aus der Response holen – gleiche Logik wie bei deinem /ask
         try:
-            # übliche Struktur der Responses-API
             reply_text = resp.output[0].content[0].text
         except Exception:
-            # Fallback, falls du ein anderes Format verwendest
             reply_text = getattr(resp, "output_text", str(resp))
 
-        # Hier könntest du optional usage auswerten, wenn du willst:
-        # new_usage = resp.usage.total_tokens  # oder etwas Ähnliches
-        new_usage = None
+        # ✅ Usage zaehlen
+        user.monthly_usage += 1
+        db.commit()
+        db.refresh(user)
 
-        return DuoChatResponse(reply=reply_text.strip(), usage=new_usage)
+        return DuoChatResponse(
+            reply=reply_text.strip(),
+            usage=user.monthly_usage,
+            limit=limit,
+        )
 
     except Exception as e:
         print("Fehler in /duoChat:", repr(e))
         return DuoChatResponse(
-            reply="Entschuldigung, ich kann gerade nicht gut antworten – es gab einen technischen Fehler.",
+            reply="Entschuldigung, ich kann gerade nicht gut antworten - es gab einen technischen Fehler.",
             usage=None,
+            limit=limit,
         )
+
+
 @app.post("/duoDoctorChat", response_model=DuoChatResponse)
-async def duo_doctor_chat(req: DuoChatRequest):
+async def duo_doctor_chat(req: DuoChatRequest, db: Session = Depends(get_db)):
     """
-    Coaching für die Arzt-Rolle im Duo-Modus.
+    Coaching fuer die Arzt-Rolle im Duo-Modus.
     iOS schickt: userId, caseTitle, caseDescription, messages[role, content]
     """
 
+    # --- Plan/Limits wie bei /ask ---
+    user = get_or_create_user(db, req.userId)
+    apply_month_reset(user)
+
+    plan = user.plan
+    limit = get_limit_for_plan(plan)
+
+    if user.monthly_usage >= limit:
+        raise HTTPException(status_code=403, detail="Limit erreicht")
+
+    model_name = get_model_for_plan(plan)
+
     system_prompt = (
-        "Du bist ein erfahrener Neurologe und Lehrarzt. "
+        "Du bist ein erfahrener Neurologe und Lehrarzt.\n"
         "Du siehst den Dialog zwischen einem Patienten und einem Assistenzarzt.\n"
-        "Der Assistenzarzt tippt ein, was der Patient sagt. "
-        "Deine Aufgabe ist, knappe, konkrete Vorschläge zu machen:\n"
-        "- Welche Frage sollte der Arzt als nächstes stellen?\n"
-        "- Welche körperliche Untersuchung oder Zusatzdiagnostik bietet sich an?\n"
-        "Antworte in 1–3 kurzen Sätzen auf Deutsch, als Vorschlag an den Arzt.\n\n"
+        "Deine Aufgabe ist, knappe, konkrete Vorschlaege zu machen:\n"
+        "- Welche Frage sollte der Arzt als naechstes stellen?\n"
+        "- Welche koerperliche Untersuchung oder Zusatzdiagnostik bietet sich an?\n"
+        "Antworte in 1-3 kurzen Saetzen auf Deutsch, als Vorschlag an den Arzt.\n\n"
         f"Falltitel: {req.caseTitle}\n\n"
         f"Fallbeschreibung (medizinischer Hintergrund):\n{req.caseDescription}\n"
     )
@@ -597,17 +626,15 @@ async def duo_doctor_chat(req: DuoChatRequest):
         if msg.role == "patient":
             lines.append(f"Patient: {msg.content}")
         else:
-            lines.append(f"Arzt-Coach: {msg.content}")
-    conversation_text = "\n".join(lines) if lines else "Noch keine Aussagen."
+            lines.append(f"Arzt: {msg.content}")
+    conversation_text = "\n".join(lines) if lines else "(noch kein Dialog)"
 
     prompt = (
         system_prompt
         + "\n\nBisheriger Dialog:\n"
         + conversation_text
-        + "\n\nDein nächster Vorschlag an den Arzt:"
+        + "\n\nDein naechster Vorschlag an den Arzt:"
     )
-
-    model_name = PLAN_CONFIG.get("free", {}).get("model") or "gpt-4.5-mini"
 
     try:
         resp = client.responses.create(
@@ -620,12 +647,22 @@ async def duo_doctor_chat(req: DuoChatRequest):
         except Exception:
             reply_text = getattr(resp, "output_text", str(resp))
 
-        return DuoChatResponse(reply=reply_text.strip(), usage=None)
+        # ✅ Usage zaehlen (Coach zaehlt mit)
+        user.monthly_usage += 1
+        db.commit()
+        db.refresh(user)
+
+        return DuoChatResponse(
+            reply=reply_text.strip(),
+            usage=user.monthly_usage,
+            limit=limit,
+        )
 
     except Exception as e:
         print("Fehler in /duoDoctorChat:", repr(e))
         return DuoChatResponse(
-            reply="Ich kann gerade keine sinnvollen Vorschläge machen – es gab einen technischen Fehler.",
+            reply="Ich kann gerade keine sinnvollen Vorschlaege machen - es gab einen technischen Fehler.",
             usage=None,
+            limit=limit,
         )
 

@@ -41,15 +41,14 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 PLAN_CONFIG = {
     "free": {
         "limit": 6,
-        # Platzhalter – in Render über OPENAI_MODEL_FREE überschreibbar
         "model": os.getenv("OPENAI_MODEL_FREE", "gpt-4.5"),
     },
-    "pro": {
-        "limit": 300,
-        "model": os.getenv("OPENAI_MODEL_PRO", "gpt-5-mini"),
+    "plus": {   # statt "pro"
+        "limit": 150,
+        "model": os.getenv("OPENAI_MODEL_PLUS", "gpt-5-mini"),
     },
     "premium": {
-        "limit": 300,
+        "limit": 1000,
         "model": os.getenv("OPENAI_MODEL_PREMIUM", "gpt-5.1"),
     },
 }
@@ -199,6 +198,17 @@ class DuoChatResponse(BaseModel):
     reply: str
     usage: Optional[int] = None   # falls du Usage/Limits mitschicken willst
 
+class TransactionPayload(BaseModel):
+    userId: str
+    productId: str
+    transactionJWS: Optional[str] = None
+    planHint: Optional[str] = None
+
+class TransactionResponse(BaseModel):
+    plan: str
+    monthlyUsage: int
+    limit: int
+
 
 # -------------------------------------------------------
 # Helper für Apple Public Key
@@ -291,7 +301,7 @@ async def validate_receipt(payload: ReceiptPayload, db: Session = Depends(get_db
     if "Premium1000" in product_ids:
         plan = "premium"
     elif "Plus150" in product_ids:
-        plan = "pro"
+        plan = "plus"
     else:
         plan = "free"
 
@@ -306,6 +316,44 @@ async def validate_receipt(payload: ReceiptPayload, db: Session = Depends(get_db
     limit = get_limit_for_plan(plan)
 
     return ReceiptResponse(
+        plan=plan,
+        monthlyUsage=user.monthly_usage,
+        limit=limit,
+    )
+@app.post("/validateTransaction", response_model=TransactionResponse)
+async def validate_transaction(payload: TransactionPayload, db: Session = Depends(get_db)):
+    user_id = payload.userId
+    product_id = payload.productId
+
+    # MVP: Plan aus productId ableiten (später: transactionJWS wirklich verifizieren)
+    if product_id == "Premium1000":
+        plan = "premium"
+    elif product_id == "Plus150":
+        plan = "plus"
+    else:
+        # fallback: planHint nutzen, falls productId leer ist
+        if payload.planHint in ("free", "plus", "premium"):
+            plan = payload.planHint
+        else:
+            plan = "free"
+
+    user = get_or_create_user(db, user_id)
+    apply_month_reset(user)
+
+    # Plan setzen
+    user.plan = plan
+
+    # Optional: Usage NICHT automatisch resetten (sonst kann man durch plan-swap resetten)
+    # Wenn du resetten willst, dann bewusst:
+    # user.monthly_usage = 0
+    # user.usage_month = current_month_str()
+
+    db.commit()
+    db.refresh(user)
+
+    limit = get_limit_for_plan(plan)
+
+    return TransactionResponse(
         plan=plan,
         monthlyUsage=user.monthly_usage,
         limit=limit,

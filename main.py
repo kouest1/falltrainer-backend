@@ -698,24 +698,28 @@ async def duo_doctor_chat(req: DuoChatRequest, db: Session = Depends(get_db)):
         + "\n\nDein naechster Vorschlag an den Arzt:"
     )
 
-    try:
-        resp = client.responses.create(model=model_name, input=prompt)
-        reply_text = extract_text_from_responses_api(resp).strip()
+try:
+    # Stabil wie bei /ask: Chat Completions
+    reply_text = call_openai(prompt, model_name=model_name).strip()
 
-        user.monthly_usage += 1
-        db.commit()
-        db.refresh(user)
+    # ✅ Usage zählen
+    user.monthly_usage += 1
+    db.commit()
+    db.refresh(user)
 
-        return DuoChatResponse(reply=reply_text, usage=user.monthly_usage, limit=limit)
+    return DuoChatResponse(
+        reply=reply_text,
+        usage=user.monthly_usage,
+        limit=limit
+    )
 
-    except Exception as e:
-        print("Fehler in /duoDoctorChat:", repr(e))
-        return DuoChatResponse(
-            reply="Ich kann gerade keine sinnvollen Vorschlaege machen - es gab einen technischen Fehler.",
-            usage=None,
-            limit=limit,
-        )
-
+except Exception as e:
+    print("Fehler in /duoDoctorChat:", repr(e))
+    return DuoChatResponse(
+        reply="Ich kann gerade keine sinnvollen Vorschlaege machen - es gab einen technischen Fehler.",
+        usage=None,
+        limit=limit
+    )
 
 # -------------------------------------------------------
 # NEW: Duo Session REST (iPad erstellt, iPhone joint)

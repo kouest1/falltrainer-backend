@@ -639,9 +639,10 @@ async def duo_chat(req: DuoChatRequest, db: Session = Depends(get_db)):
     )
 
     try:
-        resp = client.responses.create(model=model_name, input=prompt)
-        reply_text = extract_text_from_responses_api(resp).strip()
+        # ✅ Statt Responses-API: nutze deine vorhandene call_openai()-Funktion
+        reply_text = call_openai(prompt, model_name=model_name).strip()
 
+        # ✅ Usage zählen (Duo zählt mit)
         user.monthly_usage += 1
         db.commit()
         db.refresh(user)
@@ -651,7 +652,7 @@ async def duo_chat(req: DuoChatRequest, db: Session = Depends(get_db)):
     except Exception as e:
         print("Fehler in /duoChat:", repr(e))
         return DuoChatResponse(
-            reply="Entschuldigung, ich kann gerade nicht gut antworten - es gab einen technischen Fehler.",
+            reply="Entschuldigung, ich kann gerade nicht gut antworten – es gab einen technischen Fehler.",
             usage=None,
             limit=limit,
         )

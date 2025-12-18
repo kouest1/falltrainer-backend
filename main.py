@@ -746,12 +746,13 @@ async def duo_session_create(payload: DuoSessionCreatePayload, db: Session = Dep
     s = DuoSession(
         session_id=session_id,
         join_code=join_code,
-        doctor_user_id=payload.userId,
-        patient_user_id=None,
+        doctor_user_id=None,              # ✅ Doctor kommt später per Join rein
+        patient_user_id=payload.userId,   # ✅ Ersteller ist Patient
         case_title=payload.caseTitle,
         case_description=payload.caseDescription,
         created_at=now,
         expires_at=expires_at,
+
     )
 
     db.add(s)
@@ -774,11 +775,11 @@ async def duo_session_join(payload: DuoSessionJoinPayload, db: Session = Depends
     if s.expires_at < datetime.utcnow():
         raise HTTPException(status_code=410, detail="Session ist abgelaufen")
 
-    # nur 1 patient pro session
-    if s.patient_user_id and s.patient_user_id != payload.userId:
+    # ✅ nur 1 doctor pro session
+    if s.doctor_user_id and s.doctor_user_id != payload.userId:
         raise HTTPException(status_code=409, detail="Session ist bereits belegt")
 
-    s.patient_user_id = payload.userId
+    s.doctor_user_id = payload.userId
     db.commit()
     db.refresh(s)
 
@@ -800,9 +801,13 @@ async def duo_session_join(payload: DuoSessionJoinPayload, db: Session = Depends
 #   wss://HOST/ws/duo/{sessionId}?role=patient&userId=...
 # -------------------------------------------------------
 
+from fastapi import WebSocket, WebSocketDisconnect
+from datetime import datetime
+import json
+
 @app.websocket("/ws/duo/{session_id}")
 async def ws_duo(session_id: str, websocket: WebSocket):
-    role = websocket.query_params.get("role")  # doctor | patient
+    role = websocket.query_params.get("role")  # "doctor" | "patient"
     user_id = websocket.query_params.get("userId")
 
     if role not in ("doctor", "patient") or not user_id:
@@ -812,23 +817,28 @@ async def ws_duo(session_id: str, websocket: WebSocket):
     db = SessionLocal()
     try:
         s = db.query(DuoSession).filter(DuoSession.session_id == session_id).first()
-        if not s:
-            await websocket.close(code=1008)
-            return
-        if s.expires_at < datetime.utcnow():
+        if not s or s.expires_at < datetime.utcnow():
             await websocket.close(code=1008)
             return
 
-        # Berechtigungen
-        if role == "doctor" and user_id != s.doctor_user_id:
-            await websocket.close(code=1008)
-            return
+        # -------------------------------------------------
+        # ✅ Rollenbesetzung / Berechtigung
+        # Host=Patient möglich: doctor_user_id darf später gesetzt werden.
+        # -------------------------------------------------
         if role == "patient":
             if s.patient_user_id and user_id != s.patient_user_id:
                 await websocket.close(code=1008)
                 return
             if not s.patient_user_id:
                 s.patient_user_id = user_id
+                db.commit()
+
+        if role == "doctor":
+            if s.doctor_user_id and user_id != s.doctor_user_id:
+                await websocket.close(code=1008)
+                return
+            if not s.doctor_user_id:
+                s.doctor_user_id = user_id
                 db.commit()
 
         await ws_manager.connect(session_id, role, websocket)
@@ -844,7 +854,9 @@ async def ws_duo(session_id: str, websocket: WebSocket):
 
             msg_type = data.get("type")
 
-            # Optional: doctor kann case setzen/aktualisieren
+            # -------------------------------------------------
+            # ✅ Doctor kann Case setzen
+            # -------------------------------------------------
             if msg_type == "init_case" and role == "doctor":
                 s.case_title = data.get("caseTitle") or s.case_title
                 s.case_description = data.get("caseDescription") or s.case_description
@@ -852,13 +864,52 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                 await ws_manager.broadcast(session_id, "doctor", {"type": "status", "message": "Case gespeichert"})
                 continue
 
-            # Patient sendet Text -> Doctor bekommt live Text + auto coach
+            # -------------------------------------------------
+            # ✅ Doctor -> Patient (wichtig für deinen Flow)
+            # -------------------------------------------------
+            if msg_type == "doctor_text" and role == "doctor":
+                text = (data.get("text") or "").strip()
+                if not text:
+                    continue
+
+                ws_manager.history.setdefault(session_id, [])
+                ws_manager.history[session_id].append({"role": "doctor", "content": text})
+
+                await ws_manager.broadcast(session_id, "patient", {
+                    "type": "doctor_text",
+                    "text": text
+                })
+                continue
+
+            # -------------------------------------------------
+            # ✅ Patient -> Doctor (Patient-KI Antwort oder Patient-Text)
+            # -------------------------------------------------
             if msg_type == "patient_text" and role == "patient":
                 text = (data.get("text") or "").strip()
                 if not text:
                     continue
 
-                # Wir belasten IMMER den Doctor (Session Owner)
+                # History (in-memory)
+                ws_manager.history.setdefault(session_id, [])
+                ws_manager.history[session_id].append({"role": "patient", "content": text})
+
+                # Wenn kein Doctor verbunden/gesetzt ist: nur Status, kein Billing/Coach möglich
+                if not s.doctor_user_id:
+                    await ws_manager.broadcast(session_id, "patient", {
+                        "type": "status",
+                        "message": "Noch kein Arzt in der Session. Warte auf Beitritt."
+                    })
+                    continue
+
+                # Doctor bekommt live Patiententext
+                await ws_manager.broadcast(session_id, "doctor", {
+                    "type": "patient_text",
+                    "text": text
+                })
+
+                # -------------------------------------------------
+                # OPTIONAL: Auto-Coach wie bisher (kostet Usage)
+                # -------------------------------------------------
                 doctor = get_or_create_user(db, s.doctor_user_id)
                 apply_month_reset(doctor)
 
@@ -867,28 +918,20 @@ async def ws_duo(session_id: str, websocket: WebSocket):
 
                 # 1) patient_text zählt
                 if doctor.monthly_usage >= limit:
-                    await ws_manager.broadcast(session_id, "doctor", {"type": "error", "message": "Limit erreicht", "usage": doctor.monthly_usage, "limit": limit})
+                    await ws_manager.broadcast(session_id, "doctor", {
+                        "type": "error",
+                        "message": "Limit erreicht",
+                        "usage": doctor.monthly_usage,
+                        "limit": limit
+                    })
                     continue
 
                 doctor.monthly_usage += 1
                 db.commit()
                 db.refresh(doctor)
 
-                # History (in-memory)
-                ws_manager.history.setdefault(session_id, [])
-                ws_manager.history[session_id].append({"role": "patient", "content": text})
-
-                # Broadcast patient text to doctor
-                await ws_manager.broadcast(session_id, "doctor", {
-                    "type": "patient_text",
-                    "text": text,
-                    "usage": doctor.monthly_usage,
-                    "limit": limit
-                })
-
                 # 2) coach_suggestion zählt auch (nur wenn case vorhanden)
                 if not s.case_title or not s.case_description:
-                    # Arzt muss einmalig init_case senden
                     await ws_manager.broadcast(session_id, "doctor", {
                         "type": "status",
                         "message": "Kein Fallkontext gesetzt. Sende init_case vom iPad."
@@ -896,7 +939,12 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                     continue
 
                 if doctor.monthly_usage >= limit:
-                    await ws_manager.broadcast(session_id, "doctor", {"type": "error", "message": "Limit erreicht", "usage": doctor.monthly_usage, "limit": limit})
+                    await ws_manager.broadcast(session_id, "doctor", {
+                        "type": "error",
+                        "message": "Limit erreicht",
+                        "usage": doctor.monthly_usage,
+                        "limit": limit
+                    })
                     continue
 
                 model_name = get_model_for_plan(plan)
@@ -909,7 +957,6 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                     print("Coach WS error:", repr(e))
                     reply_text = "Technischer Fehler beim Coach."
 
-                # Count coach suggestion
                 doctor.monthly_usage += 1
                 db.commit()
                 db.refresh(doctor)

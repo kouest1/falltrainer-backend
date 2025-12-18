@@ -844,133 +844,139 @@ async def ws_duo(session_id: str, websocket: WebSocket):
         await ws_manager.connect(session_id, role, websocket)
         await websocket.send_text(json.dumps({"type": "connected", "sessionId": session_id, "role": role}))
 
-        while True:
-            raw = await websocket.receive_text()
-            try:
-                data = json.loads(raw)
-            except Exception:
-                await websocket.send_text(json.dumps({"type": "error", "message": "Invalid JSON"}))
-                continue
+while True:
+    raw = await websocket.receive_text()
+    try:
+        data = json.loads(raw)
+    except Exception:
+        await websocket.send_text(json.dumps({"type": "error", "message": "Invalid JSON"}))
+        continue
 
-            msg_type = data.get("type")
+    msg_type = data.get("type")
 
-            # -------------------------------------------------
-            # ✅ Doctor kann Case setzen
-            # -------------------------------------------------
-            if msg_type == "init_case" and role == "doctor":
-                s.case_title = data.get("caseTitle") or s.case_title
-                s.case_description = data.get("caseDescription") or s.case_description
-                db.commit()
-                await ws_manager.broadcast(session_id, "doctor", {"type": "status", "message": "Case gespeichert"})
-                continue
+    # -------------------------------------------------
+    # ✅ Doctor kann Case setzen
+    # -------------------------------------------------
+    if msg_type == "init_case" and role == "doctor":
+        s.case_title = data.get("caseTitle") or s.case_title
+        s.case_description = data.get("caseDescription") or s.case_description
+        db.commit()
+        await ws_manager.broadcast(session_id, "doctor", {"type": "status", "message": "Case gespeichert"})
+        continue
 
-            # -------------------------------------------------
-            # ✅ Doctor -> Patient (wichtig für deinen Flow)
-            # -------------------------------------------------
-            if msg_type == "doctor_text" and role == "doctor":
-                text = (data.get("text") or "").strip()
-                if not text:
-                    continue
+    # -------------------------------------------------
+    # ✅ Doctor -> Patient (Arzttext live an Patient)
+    # -------------------------------------------------
+    if msg_type == "doctor_text" and role == "doctor":
+        text = (data.get("text") or "").strip()
+        if not text:
+            continue
 
-                ws_manager.history.setdefault(session_id, [])
-                ws_manager.history[session_id].append({"role": "doctor", "content": text})
+        ws_manager.history.setdefault(session_id, [])
+        ws_manager.history[session_id].append({"role": "doctor", "content": text})
 
-                await ws_manager.broadcast(session_id, "patient", {
-                    "type": "doctor_text",
-                    "text": text
-                })
-                continue
+        await ws_manager.broadcast(session_id, "patient", {
+            "type": "doctor_text",
+            "text": text
+        })
+        continue
 
-            # -------------------------------------------------
-            # ✅ Patient -> Doctor (Patient-KI Antwort oder Patient-Text)
-            # -------------------------------------------------
-            if msg_type == "patient_text" and role == "patient":
-                text = (data.get("text") or "").strip()
-                if not text:
-                    continue
+    # -------------------------------------------------
+    # ✅ Patient -> Doctor (Patienttext / Patient-KI Antwort)
+    # -------------------------------------------------
+    if msg_type == "patient_text" and role == "patient":
+        text = (data.get("text") or "").strip()
+        if not text:
+            continue
 
-                # History (in-memory)
-                ws_manager.history.setdefault(session_id, [])
-                ws_manager.history[session_id].append({"role": "patient", "content": text})
+        # History (in-memory)
+        ws_manager.history.setdefault(session_id, [])
+        ws_manager.history[session_id].append({"role": "patient", "content": text})
 
-                # Wenn kein Doctor verbunden/gesetzt ist: nur Status, kein Billing/Coach möglich
-                if not s.doctor_user_id:
-                    await ws_manager.broadcast(session_id, "patient", {
-                        "type": "status",
-                        "message": "Noch kein Arzt in der Session. Warte auf Beitritt."
-                    })
-                    continue
+        # Wenn noch kein Doctor gesetzt ist: nur Status, kein Billing/Coach möglich
+        if not s.doctor_user_id:
+            await ws_manager.broadcast(session_id, "patient", {
+                "type": "status",
+                "message": "Noch kein Arzt in der Session. Warte auf Beitritt."
+            })
+            continue
 
-                # Doctor bekommt live Patiententext
-                await ws_manager.broadcast(session_id, "doctor", {
-                    "type": "patient_text",
-                    "text": text
-                })
+        # Doctor bekommt live Patiententext
+        await ws_manager.broadcast(session_id, "doctor", {
+            "type": "patient_text",
+            "text": text
+        })
 
-                # -------------------------------------------------
-                # OPTIONAL: Auto-Coach wie bisher (kostet Usage)
-                # -------------------------------------------------
-                doctor = get_or_create_user(db, s.doctor_user_id)
-                apply_month_reset(doctor)
+        # -------------------------------------------------
+        # OPTIONAL: Auto-Coach wie bisher (kostet Usage)
+        # -------------------------------------------------
+        doctor = get_or_create_user(db, s.doctor_user_id)
+        apply_month_reset(doctor)
 
-                plan = doctor.plan
-                limit = get_limit_for_plan(plan)
+        plan = doctor.plan
+        limit = get_limit_for_plan(plan)
 
-                # 1) patient_text zählt
-                if doctor.monthly_usage >= limit:
-                    await ws_manager.broadcast(session_id, "doctor", {
-                        "type": "error",
-                        "message": "Limit erreicht",
-                        "usage": doctor.monthly_usage,
-                        "limit": limit
-                    })
-                    continue
+        # 1) patient_text zählt
+        if doctor.monthly_usage >= limit:
+            await ws_manager.broadcast(session_id, "doctor", {
+                "type": "error",
+                "message": "Limit erreicht",
+                "usage": doctor.monthly_usage,
+                "limit": limit
+            })
+            continue
 
-                doctor.monthly_usage += 1
-                db.commit()
-                db.refresh(doctor)
+        doctor.monthly_usage += 1
+        db.commit()
+        db.refresh(doctor)
 
-                # 2) coach_suggestion zählt auch (nur wenn case vorhanden)
-                if not s.case_title or not s.case_description:
-                    await ws_manager.broadcast(session_id, "doctor", {
-                        "type": "status",
-                        "message": "Kein Fallkontext gesetzt. Sende init_case vom iPad."
-                    })
-                    continue
+        # 2) coach_suggestion zählt auch (nur wenn case vorhanden)
+        if not s.case_title or not s.case_description:
+            await ws_manager.broadcast(session_id, "doctor", {
+                "type": "status",
+                "message": "Kein Fallkontext gesetzt. Sende init_case vom iPad."
+            })
+            continue
 
-                if doctor.monthly_usage >= limit:
-                    await ws_manager.broadcast(session_id, "doctor", {
-                        "type": "error",
-                        "message": "Limit erreicht",
-                        "usage": doctor.monthly_usage,
-                        "limit": limit
-                    })
-                    continue
+        if doctor.monthly_usage >= limit:
+            await ws_manager.broadcast(session_id, "doctor", {
+                "type": "error",
+                "message": "Limit erreicht",
+                "usage": doctor.monthly_usage,
+                "limit": limit
+            })
+            continue
 
-                model_name = get_model_for_plan(plan)
-                coach_prompt = build_coach_prompt(s.case_title, s.case_description, ws_manager.history[session_id])
+        model_name = get_model_for_plan(plan)
+        coach_prompt = build_coach_prompt(
+            s.case_title,
+            s.case_description,
+            ws_manager.history[session_id]
+        )
 
-                try:
-                    resp = client.responses.create(model=model_name, input=coach_prompt)
-                    reply_text = extract_text_from_responses_api(resp).strip()
-                except Exception as e:
-                    print("Coach WS error:", repr(e))
-                    reply_text = "Technischer Fehler beim Coach."
+        try:
+            resp = client.responses.create(model=model_name, input=coach_prompt)
+            reply_text = extract_text_from_responses_api(resp).strip()
+        except Exception as e:
+            print("Coach WS error:", repr(e))
+            reply_text = "Technischer Fehler beim Coach."
 
-                doctor.monthly_usage += 1
-                db.commit()
-                db.refresh(doctor)
+        doctor.monthly_usage += 1
+        db.commit()
+        db.refresh(doctor)
 
-                await ws_manager.broadcast(session_id, "doctor", {
-                    "type": "coach_suggestion",
-                    "text": reply_text,
-                    "usage": doctor.monthly_usage,
-                    "limit": limit
-                })
-                continue
+        await ws_manager.broadcast(session_id, "doctor", {
+            "type": "coach_suggestion",
+            "text": reply_text,
+            "usage": doctor.monthly_usage,
+            "limit": limit
+        })
+        continue
 
-            # Unknown
-            await websocket.send_text(json.dumps({"type": "error", "message": "Unknown event type"}))
+    # -------------------------------------------------
+    # Unknown
+    # -------------------------------------------------
+    await websocket.send_text(json.dumps({"type": "error", "message": "Unknown event type"}))
 
     except WebSocketDisconnect:
         pass

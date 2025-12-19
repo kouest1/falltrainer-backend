@@ -291,25 +291,31 @@ class WSManager:
         self.history: Dict[str, List[Dict[str, str]]] = {}
 
     async def connect(self, session_id: str, role: str, websocket: WebSocket):
-        await websocket.accept()
+        # ✅ WICHTIG: KEIN websocket.accept() hier!
         self.sessions.setdefault(session_id, {"doctor": set(), "patient": set()})
         self.sessions[session_id][role].add(websocket)
         self.history.setdefault(session_id, [])
 
     def disconnect(self, session_id: str, role: str, websocket: WebSocket):
         try:
-            self.sessions[session_id][role].remove(websocket)
+            self.sessions.get(session_id, {}).get(role, set()).discard(websocket)
         except Exception:
             pass
 
     async def broadcast(self, session_id: str, role: str, payload: Dict[str, Any]):
         targets = list(self.sessions.get(session_id, {}).get(role, set()))
+        msg = json.dumps(payload)
+
+        dead: List[WebSocket] = []
         for ws in targets:
             try:
-                await ws.send_text(json.dumps(payload))
+                await ws.send_text(msg)
             except Exception:
-                pass
+                dead.append(ws)
 
+        # kaputte sockets cleanup
+        for ws in dead:
+            self.sessions.get(session_id, {}).get(role, set()).discard(ws)
 
 ws_manager = WSManager()
 
@@ -807,16 +813,15 @@ import json
 
 @app.websocket("/ws/duo/{session_id}")
 async def ws_duo(session_id: str, websocket: WebSocket):
-    role = websocket.query_params.get("role")   # "doctor" | "patient"
+    # ✅ accept GENAU EINMAL – hier!
+    await websocket.accept()
+
+    role = websocket.query_params.get("role")  # "doctor" | "patient"
     user_id = websocket.query_params.get("userId")
 
-    # 1) Basic validation
     if role not in ("doctor", "patient") or not user_id:
         await websocket.close(code=1008)
         return
-
-    # 2) IMPORTANT: accept the websocket (if your ws_manager.connect() does NOT do it)
-    await websocket.accept()
 
     db = SessionLocal()
     try:
@@ -825,7 +830,9 @@ async def ws_duo(session_id: str, websocket: WebSocket):
             await websocket.close(code=1008)
             return
 
-        # 3) Role assignment / permission
+        # -------------------------------------------------
+        # Rollenbesetzung / Berechtigung
+        # -------------------------------------------------
         if role == "patient":
             if s.patient_user_id and user_id != s.patient_user_id:
                 await websocket.close(code=1008)
@@ -842,7 +849,6 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                 s.doctor_user_id = user_id
                 db.commit()
 
-        # 4) connect in manager + send connected
         await ws_manager.connect(session_id, role, websocket)
         await websocket.send_text(json.dumps({
             "type": "connected",
@@ -850,12 +856,11 @@ async def ws_duo(session_id: str, websocket: WebSocket):
             "role": role
         }))
 
-        print(f"[DUO WS] connected session={session_id} role={role} user={user_id}")
-
-        # 5) main receive loop
+        # -------------------------------------------------
+        # MAIN RECEIVE LOOP
+        # -------------------------------------------------
         while True:
             raw = await websocket.receive_text()
-
             try:
                 data = json.loads(raw)
             except Exception:
@@ -863,25 +868,16 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                 continue
 
             msg_type = data.get("type")
-            print(f"[DUO WS] recv session={session_id} role={role} type={msg_type}")
 
-            # -----------------------------
-            # Doctor can set/update case
-            # -----------------------------
+            # ✅ Doctor kann Case setzen
             if msg_type == "init_case" and role == "doctor":
                 s.case_title = data.get("caseTitle") or s.case_title
                 s.case_description = data.get("caseDescription") or s.case_description
                 db.commit()
-
-                await ws_manager.broadcast(session_id, "doctor", {
-                    "type": "status",
-                    "message": "Case gespeichert"
-                })
+                await ws_manager.broadcast(session_id, "doctor", {"type": "status", "message": "Case gespeichert"})
                 continue
 
-            # -----------------------------
-            # Doctor -> Patient
-            # -----------------------------
+            # ✅ Doctor -> Patient
             if msg_type == "doctor_text" and role == "doctor":
                 text = (data.get("text") or "").strip()
                 if not text:
@@ -890,18 +886,10 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                 ws_manager.history.setdefault(session_id, [])
                 ws_manager.history[session_id].append({"role": "doctor", "content": text})
 
-                await ws_manager.broadcast(session_id, "patient", {
-                    "type": "doctor_text",
-                    "text": text
-                })
-
-                # optional ack back to sender (helps debugging)
-                await websocket.send_text(json.dumps({"type": "ack", "ackType": "doctor_text"}))
+                await ws_manager.broadcast(session_id, "patient", {"type": "doctor_text", "text": text})
                 continue
 
-            # -----------------------------
-            # Patient -> Doctor
-            # -----------------------------
+            # ✅ Patient -> Doctor
             if msg_type == "patient_text" and role == "patient":
                 text = (data.get("text") or "").strip()
                 if not text:
@@ -910,99 +898,64 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                 ws_manager.history.setdefault(session_id, [])
                 ws_manager.history[session_id].append({"role": "patient", "content": text})
 
-                # If no doctor yet: just tell patient device
-                if not s.doctor_user_id:
-                    await ws_manager.broadcast(session_id, "patient", {
-                        "type": "status",
-                        "message": "Noch kein Arzt in der Session. Warte auf Beitritt."
-                    })
-                    continue
+                # Doctor bekommt live Patiententext
+                await ws_manager.broadcast(session_id, "doctor", {"type": "patient_text", "text": text})
 
-                # broadcast patient text to doctor device
-                await ws_manager.broadcast(session_id, "doctor", {
-                    "type": "patient_text",
-                    "text": text
-                })
+                # OPTIONAL: Auto-Coach (nur wenn case vorhanden)
+                if s.doctor_user_id and s.case_title and s.case_description:
+                    doctor = get_or_create_user(db, s.doctor_user_id)
+                    apply_month_reset(doctor)
 
-                # ----- OPTIONAL auto-coach (billing) -----
-                doctor = get_or_create_user(db, s.doctor_user_id)
-                apply_month_reset(doctor)
+                    plan = doctor.plan
+                    limit = get_limit_for_plan(plan)
 
-                plan = doctor.plan
-                limit = get_limit_for_plan(plan)
+                    if doctor.monthly_usage >= limit:
+                        await ws_manager.broadcast(session_id, "doctor", {
+                            "type": "error",
+                            "message": "Limit erreicht",
+                            "usage": doctor.monthly_usage,
+                            "limit": limit
+                        })
+                        continue
 
-                # patient_text counts
-                if doctor.monthly_usage >= limit:
+                    # patient_text usage
+                    doctor.monthly_usage += 1
+                    db.commit()
+                    db.refresh(doctor)
+
+                    model_name = get_model_for_plan(plan)
+                    coach_prompt = build_coach_prompt(s.case_title, s.case_description, ws_manager.history[session_id])
+
+                    try:
+                        resp = client.responses.create(model=model_name, input=coach_prompt)
+                        reply_text = extract_text_from_responses_api(resp).strip()
+                    except Exception as e:
+                        print("Coach WS error:", repr(e))
+                        reply_text = "Technischer Fehler beim Coach."
+
+                    # coach_suggestion usage
+                    doctor.monthly_usage += 1
+                    db.commit()
+                    db.refresh(doctor)
+
                     await ws_manager.broadcast(session_id, "doctor", {
-                        "type": "error",
-                        "message": "Limit erreicht",
+                        "type": "coach_suggestion",
+                        "text": reply_text,
                         "usage": doctor.monthly_usage,
                         "limit": limit
                     })
-                    continue
-
-                doctor.monthly_usage += 1
-                db.commit()
-                db.refresh(doctor)
-
-                if not s.case_title or not s.case_description:
-                    await ws_manager.broadcast(session_id, "doctor", {
-                        "type": "status",
-                        "message": "Kein Fallkontext gesetzt. Sende init_case vom iPad."
-                    })
-                    continue
-
-                if doctor.monthly_usage >= limit:
-                    await ws_manager.broadcast(session_id, "doctor", {
-                        "type": "error",
-                        "message": "Limit erreicht",
-                        "usage": doctor.monthly_usage,
-                        "limit": limit
-                    })
-                    continue
-
-                model_name = get_model_for_plan(plan)
-                coach_prompt = build_coach_prompt(
-                    s.case_title,
-                    s.case_description,
-                    ws_manager.history[session_id]
-                )
-
-                try:
-                    resp = client.responses.create(model=model_name, input=coach_prompt)
-                    reply_text = extract_text_from_responses_api(resp).strip()
-                except Exception as e:
-                    print("Coach WS error:", repr(e))
-                    reply_text = "Technischer Fehler beim Coach."
-
-                doctor.monthly_usage += 1
-                db.commit()
-                db.refresh(doctor)
-
-                await ws_manager.broadcast(session_id, "doctor", {
-                    "type": "coach_suggestion",
-                    "text": reply_text,
-                    "usage": doctor.monthly_usage,
-                    "limit": limit
-                })
-
-                await websocket.send_text(json.dumps({"type": "ack", "ackType": "patient_text"}))
                 continue
 
-            # -----------------------------
             # Unknown
-            # -----------------------------
-            await websocket.send_text(json.dumps({
-                "type": "error",
-                "message": f"Unknown event type: {msg_type}"
-            }))
+            await websocket.send_text(json.dumps({"type": "error", "message": "Unknown event type"}))
 
     except WebSocketDisconnect:
-        print(f"[DUO WS] disconnect session={session_id} role={role} user={user_id}")
+        pass
     finally:
         try:
             ws_manager.disconnect(session_id, role, websocket)
         except Exception:
             pass
         db.close()
+
 

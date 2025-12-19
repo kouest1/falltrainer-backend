@@ -807,12 +807,16 @@ import json
 
 @app.websocket("/ws/duo/{session_id}")
 async def ws_duo(session_id: str, websocket: WebSocket):
-    role = websocket.query_params.get("role")  # "doctor" | "patient"
+    role = websocket.query_params.get("role")   # "doctor" | "patient"
     user_id = websocket.query_params.get("userId")
 
+    # 1) Basic validation
     if role not in ("doctor", "patient") or not user_id:
         await websocket.close(code=1008)
         return
+
+    # 2) IMPORTANT: accept the websocket (if your ws_manager.connect() does NOT do it)
+    await websocket.accept()
 
     db = SessionLocal()
     try:
@@ -821,10 +825,7 @@ async def ws_duo(session_id: str, websocket: WebSocket):
             await websocket.close(code=1008)
             return
 
-        # -------------------------------------------------
-        # ✅ Rollenbesetzung / Berechtigung
-        # Host=Patient möglich: doctor_user_id darf später gesetzt werden.
-        # -------------------------------------------------
+        # 3) Role assignment / permission
         if role == "patient":
             if s.patient_user_id and user_id != s.patient_user_id:
                 await websocket.close(code=1008)
@@ -841,14 +842,20 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                 s.doctor_user_id = user_id
                 db.commit()
 
+        # 4) connect in manager + send connected
         await ws_manager.connect(session_id, role, websocket)
-        await websocket.send_text(json.dumps({"type": "connected", "sessionId": session_id, "role": role}))
+        await websocket.send_text(json.dumps({
+            "type": "connected",
+            "sessionId": session_id,
+            "role": role
+        }))
 
-        # -------------------------------------------------
-        # ✅ MAIN RECEIVE LOOP
-        # -------------------------------------------------
+        print(f"[DUO WS] connected session={session_id} role={role} user={user_id}")
+
+        # 5) main receive loop
         while True:
             raw = await websocket.receive_text()
+
             try:
                 data = json.loads(raw)
             except Exception:
@@ -856,20 +863,25 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                 continue
 
             msg_type = data.get("type")
+            print(f"[DUO WS] recv session={session_id} role={role} type={msg_type}")
 
-            # -------------------------------------------------
-            # ✅ Doctor kann Case setzen
-            # -------------------------------------------------
+            # -----------------------------
+            # Doctor can set/update case
+            # -----------------------------
             if msg_type == "init_case" and role == "doctor":
                 s.case_title = data.get("caseTitle") or s.case_title
                 s.case_description = data.get("caseDescription") or s.case_description
                 db.commit()
-                await ws_manager.broadcast(session_id, "doctor", {"type": "status", "message": "Case gespeichert"})
+
+                await ws_manager.broadcast(session_id, "doctor", {
+                    "type": "status",
+                    "message": "Case gespeichert"
+                })
                 continue
 
-            # -------------------------------------------------
-            # ✅ Doctor -> Patient (Arzttext live an Patient)
-            # -------------------------------------------------
+            # -----------------------------
+            # Doctor -> Patient
+            # -----------------------------
             if msg_type == "doctor_text" and role == "doctor":
                 text = (data.get("text") or "").strip()
                 if not text:
@@ -882,11 +894,14 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                     "type": "doctor_text",
                     "text": text
                 })
+
+                # optional ack back to sender (helps debugging)
+                await websocket.send_text(json.dumps({"type": "ack", "ackType": "doctor_text"}))
                 continue
 
-            # -------------------------------------------------
-            # ✅ Patient -> Doctor (Patienttext / Patient-KI Antwort)
-            # -------------------------------------------------
+            # -----------------------------
+            # Patient -> Doctor
+            # -----------------------------
             if msg_type == "patient_text" and role == "patient":
                 text = (data.get("text") or "").strip()
                 if not text:
@@ -895,7 +910,7 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                 ws_manager.history.setdefault(session_id, [])
                 ws_manager.history[session_id].append({"role": "patient", "content": text})
 
-                # Wenn noch kein Doctor gesetzt ist: nur Status
+                # If no doctor yet: just tell patient device
                 if not s.doctor_user_id:
                     await ws_manager.broadcast(session_id, "patient", {
                         "type": "status",
@@ -903,21 +918,20 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                     })
                     continue
 
-                # Doctor bekommt live Patiententext
+                # broadcast patient text to doctor device
                 await ws_manager.broadcast(session_id, "doctor", {
                     "type": "patient_text",
                     "text": text
                 })
 
-                # -------------------------------------------------
-                # OPTIONAL: Auto-Coach wie bisher (kostet Usage)
-                # -------------------------------------------------
+                # ----- OPTIONAL auto-coach (billing) -----
                 doctor = get_or_create_user(db, s.doctor_user_id)
                 apply_month_reset(doctor)
 
                 plan = doctor.plan
                 limit = get_limit_for_plan(plan)
 
+                # patient_text counts
                 if doctor.monthly_usage >= limit:
                     await ws_manager.broadcast(session_id, "doctor", {
                         "type": "error",
@@ -971,15 +985,20 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                     "usage": doctor.monthly_usage,
                     "limit": limit
                 })
+
+                await websocket.send_text(json.dumps({"type": "ack", "ackType": "patient_text"}))
                 continue
 
-            # -------------------------------------------------
-            # Unknown event type
-            # -------------------------------------------------
-            await websocket.send_text(json.dumps({"type": "error", "message": "Unknown event type"}))
+            # -----------------------------
+            # Unknown
+            # -----------------------------
+            await websocket.send_text(json.dumps({
+                "type": "error",
+                "message": f"Unknown event type: {msg_type}"
+            }))
 
     except WebSocketDisconnect:
-        pass
+        print(f"[DUO WS] disconnect session={session_id} role={role} user={user_id}")
     finally:
         try:
             ws_manager.disconnect(session_id, role, websocket)

@@ -9,6 +9,7 @@ from typing import List, Literal, Optional, Dict, Any
 import requests
 from jose import jwt
 from fastapi import FastAPI, HTTPException, Depends, WebSocket, WebSocketDisconnect
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy import Column, String, DateTime, Text
@@ -105,6 +106,23 @@ def call_openai(message: str, model_name: str) -> str:
     )
     content = completion.choices[0].message.content
     return content or ""
+
+def call_openai_stream(message: str, model_name: str):
+    """
+    Streamt Text (Delta-Chunks) aus OpenAI ChatCompletions und yieldet Strings.
+    """
+    stream = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": message}],
+        temperature=1,
+        stream=True,
+    )
+
+    for event in stream:
+        # event.choices[0].delta.content enthält neue Textstücke
+        delta = event.choices[0].delta.content
+        if delta:
+            yield delta
 
 
 def extract_text_from_responses_api(resp) -> str:
@@ -697,6 +715,94 @@ async def duo_chat(req: DuoChatRequest, db: Session = Depends(get_db)):
             usage=None,
             limit=limit,
         )
+
+@app.post("/duoChatStream")
+async def duo_chat_stream(req: DuoChatRequest, db: Session = Depends(get_db)):
+    user = get_or_create_user(db, req.userId)
+    apply_month_reset(user)
+
+    plan = user.plan
+    limit = get_limit_for_plan(plan)
+
+    if user.monthly_usage >= limit:
+        raise HTTPException(status_code=403, detail="Limit erreicht")
+
+    model_name = get_model_for_plan(plan)
+
+    # ✅ DEIN PROMPT – 1:1
+    system_prompt = (
+        "Du spielst in diesem Chat den PATIENTEN in einem neurologischen Trainingsgespräch (Anamnese + Untersuchung). "
+        "Der Benutzer ist der Arzt. Du kennst den Falltext, der Arzt nicht.\n\n"
+        "WICHTIG (bitte so sprechen, dass man es gut vorlesen kann):\n"
+        "- Sprich wie ein echter Patient: normale Alltagssprache, keine Fachbegriffe.\n"
+        "- Keine Diagnosen, keine Erklärungen, kein medizinisches Dozieren.\n"
+        "- Nutze nur Informationen, die im Falltext stehen. Erfinde nichts dazu.\n"
+        "- Wenn etwas nicht im Falltext steht oder du es nicht sicher weißt: sag ehrlich "
+        "\"Das weiß ich nicht\" oder \"Dazu kann ich nichts sagen\".\n"
+        "- Keine Labor/CT/MRT/EEG/LP-Ergebnisse nennen, außer sie stehen ausdrücklich im Falltext.\n\n"
+        "SO SOLLST DU ANTWORTEN:\n"
+        "- Immer in der Ich-Form (\"Ich ...\"), freundlich und menschlich.\n"
+        "- Kurz, klar, gut vorlesbar: meistens 1–3 Sätze (maximal 4).\n"
+        "- Gib nur die Infos, nach denen der Arzt gerade fragt. Keine ungefragten Info-Dumps.\n"
+        "- Wenn mehrere Fragen kommen: nacheinander kurz beantworten.\n"
+        "- Wenn der Arzt ein Wort benutzt, das du nicht verstehst: frag nach, z.B. "
+        "\"Was meinen Sie genau?\".\n\n"
+        "UNTERSUCHUNG:\n"
+        "- Wenn der Arzt dich bittet, etwas zu machen (z.B. Arme heben, gehen, Finger-Nase): "
+        "reagiere wie ein Patient und beschreibe, was du dabei merkst.\n"
+        "- Nenne objektive Befunde (z.B. \"Pupillen sind ...\", \"Reflexe sind ...\") nur, wenn sie im Falltext stehen.\n\n"
+        f"Falltitel: {req.caseTitle}\n\n"
+        f"Fallbeschreibung (nur für dich, Ground Truth):\n{req.caseDescription}\n\n"
+        "Regel für jede Antwort:\n"
+        "- Antworte als Patient ausschließlich auf die letzte Nachricht des Arztes."
+    )
+
+    convo_lines = []
+    for msg in req.messages:
+        sprecher = "Arzt" if msg.role == "doctor" else "Patient"
+        convo_lines.append(f"{sprecher}: {msg.content}")
+    conversation_text = "\n".join(convo_lines) if convo_lines else "(noch kein Dialog)"
+
+    prompt = (
+        system_prompt
+        + "\n\nBisheriger Dialog zwischen Arzt und Patient:\n"
+        + conversation_text
+        + "\n\nAntwort des Patienten (kurz und alltagssprachlich):"
+    )
+
+    def sse(obj: dict) -> str:
+        return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+    async def gen():
+        full = ""
+        try:
+            # ✅ Streaming deltas
+            for delta in call_openai_stream(prompt, model_name=model_name):
+                full += delta
+                yield sse({"delta": delta})
+
+            # ✅ Usage am Ende zählen
+            user.monthly_usage += 1
+            db.commit()
+            db.refresh(user)
+
+            yield sse({"done": True, "reply": full, "usage": user.monthly_usage, "limit": limit})
+
+        except Exception as e:
+            print("Fehler in /duoChatStream:", repr(e))
+            yield sse({
+                "done": True,
+                "reply": "Entschuldigung, ich kann gerade nicht gut antworten – es gab einen technischen Fehler.",
+                "usage": None,
+                "limit": limit
+            })
+
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no"
+    }
+    return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
 
 
 # -------------------------------------------------------

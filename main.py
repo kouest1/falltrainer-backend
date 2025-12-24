@@ -1104,9 +1104,5 @@ async def ws_duo(session_id: str, websocket: WebSocket):
         db.close()
 
 
-role, websocket)
-        except Exception:
-            pass
-        db.close()
 
 

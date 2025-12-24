@@ -94,18 +94,22 @@ def get_model_for_plan(plan: str) -> str:
     cfg = PLAN_CONFIG.get(plan, PLAN_CONFIG["free"])
     return str(cfg["model"])
 
-
-def call_openai(message: str, model_name: str) -> str:
+def call_openai_stream(message: str, model_name: str):
     """
-    Schickt den Prompt an OpenAI (Chat Completions) und gibt NUR die Modell-Antwort zurück.
+    Streamt Text (Delta-Chunks) aus OpenAI ChatCompletions und yieldet Strings.
     """
-    completion = client.chat.completions.create(
+    stream = client.chat.completions.create(
         model=model_name,
         messages=[{"role": "user", "content": message}],
         temperature=1,
+        stream=True,
     )
-    content = completion.choices[0].message.content
-    return content or ""
+
+    for chunk in stream:
+        delta = chunk.choices[0].delta.content or ""
+        if delta:
+            yield delta
+
 
 def call_openai_stream(message: str, model_name: str):
     """
@@ -723,13 +727,11 @@ async def duo_chat_stream(req: DuoChatRequest, db: Session = Depends(get_db)):
 
     plan = user.plan
     limit = get_limit_for_plan(plan)
-
     if user.monthly_usage >= limit:
         raise HTTPException(status_code=403, detail="Limit erreicht")
 
     model_name = get_model_for_plan(plan)
 
-    # ✅ DEIN PROMPT – 1:1
     system_prompt = (
         "Du spielst in diesem Chat den PATIENTEN in einem neurologischen Trainingsgespräch (Anamnese + Untersuchung). "
         "Der Benutzer ist der Arzt. Du kennst den Falltext, der Arzt nicht.\n\n"
@@ -770,38 +772,40 @@ async def duo_chat_stream(req: DuoChatRequest, db: Session = Depends(get_db)):
         + "\n\nAntwort des Patienten (kurz und alltagssprachlich):"
     )
 
+    # ✅ Usage VOR dem Stream zählen (DB bleibt sauber)
+    user.monthly_usage += 1
+    db.commit()
+    db.refresh(user)
+    usage_now = user.monthly_usage
+
     def sse(obj: dict) -> str:
         return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
 
-    async def gen():
+    def gen():
         full = ""
         try:
-            # ✅ Streaming deltas
             for delta in call_openai_stream(prompt, model_name=model_name):
                 full += delta
                 yield sse({"delta": delta})
 
-            # ✅ Usage am Ende zählen
-            user.monthly_usage += 1
-            db.commit()
-            db.refresh(user)
-
-            yield sse({"done": True, "reply": full, "usage": user.monthly_usage, "limit": limit})
+            yield sse({"done": True, "reply": full, "usage": usage_now, "limit": limit})
 
         except Exception as e:
             print("Fehler in /duoChatStream:", repr(e))
             yield sse({
                 "done": True,
                 "reply": "Entschuldigung, ich kann gerade nicht gut antworten – es gab einen technischen Fehler.",
-                "usage": None,
-                "limit": limit
+                "usage": usage_now,
+                "limit": limit,
+                "msg": repr(e)
             })
 
     headers = {
         "Cache-Control": "no-cache",
         "Connection": "keep-alive",
-        "X-Accel-Buffering": "no"
+        "X-Accel-Buffering": "no",
     }
+
     return StreamingResponse(gen(), media_type="text/event-stream", headers=headers)
 
 
@@ -1046,8 +1050,8 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                 ws_manager.history.setdefault(session_id, [])
                 ws_manager.history[session_id].append({"role": "patient", "content": text})
 
-                # Doctor bekommt live Patiententext
                 await ws_manager.broadcast(session_id, "doctor", {"type": "patient_text", "text": text})
+                continue
 
                 # OPTIONAL: Auto-Coach (nur wenn case vorhanden)
                 if s.doctor_user_id and s.case_title and s.case_description:

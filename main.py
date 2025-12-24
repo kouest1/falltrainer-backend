@@ -94,10 +94,19 @@ def get_model_for_plan(plan: str) -> str:
     cfg = PLAN_CONFIG.get(plan, PLAN_CONFIG["free"])
     return str(cfg["model"])
 
+def call_openai(message: str, model_name: str) -> str:
+    """
+    Nicht-streaming Antwort. Wird von /ask, /duoChat und /duoDoctorChat genutzt.
+    """
+    completion = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": message}],
+        temperature=1,
+    )
+    return completion.choices[0].message.content or ""
+
+
 def call_openai_stream(message: str, model_name: str):
-    """
-    Streamt Text (Delta-Chunks) aus OpenAI ChatCompletions und yieldet Strings.
-    """
     stream = client.chat.completions.create(
         model=model_name,
         messages=[{"role": "user", "content": message}],
@@ -111,22 +120,6 @@ def call_openai_stream(message: str, model_name: str):
             yield delta
 
 
-def call_openai_stream(message: str, model_name: str):
-    """
-    Streamt Text (Delta-Chunks) aus OpenAI ChatCompletions und yieldet Strings.
-    """
-    stream = client.chat.completions.create(
-        model=model_name,
-        messages=[{"role": "user", "content": message}],
-        temperature=1,
-        stream=True,
-    )
-
-    for event in stream:
-        # event.choices[0].delta.content enthält neue Textstücke
-        delta = event.choices[0].delta.content
-        if delta:
-            yield delta
 
 
 def extract_text_from_responses_api(resp) -> str:
@@ -1106,6 +1099,12 @@ async def ws_duo(session_id: str, websocket: WebSocket):
     finally:
         try:
             ws_manager.disconnect(session_id, role, websocket)
+        except Exception:
+            pass
+        db.close()
+
+
+role, websocket)
         except Exception:
             pass
         db.close()

@@ -67,7 +67,7 @@ client = OpenAI(api_key=OPENAI_API_KEY)
 PLAN_CONFIG = {
     "free": {
         "limit": 6,
-        "model": os.getenv("OPENAI_MODEL_FREE", "gpt-4.5"),
+        "model": os.getenv("OPENAI_MODEL_FREE", "gpt-4.1-mini"),
     },
     "plus": {
         "limit": 150,

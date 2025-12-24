@@ -281,6 +281,17 @@ class DuoSessionJoinResponse(BaseModel):
     sessionId: str
     ok: bool
 
+class QuickAnswersCreatePayload(BaseModel):
+    userId: str
+    sessionId: str
+
+
+class QuickAnswersResponse(BaseModel):
+    sessionId: str
+    items: List[Dict[str, str]]
+    usage: Optional[int] = None
+    limit: Optional[int] = None
+
 
 # -------------------------------------------------------
 # Helper für Apple Public Key
@@ -300,6 +311,7 @@ def get_apple_public_key(kid: str):
 
 class WSManager:
     def __init__(self):
+        self.quickanswers: Dict[str, List[Dict[str, str]]] = {}
         # session_id -> {"doctor": set(ws), "patient": set(ws)}
         self.sessions: Dict[str, Dict[str, set[WebSocket]]] = {}
         # session_id -> history list[{"role": "...", "content": "..."}]
@@ -425,6 +437,77 @@ def generate_quick_answers_with_openai(case_title: str, case_description: str, m
 def generate_join_code(length: int = 6) -> str:
     alphabet = string.ascii_uppercase + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(length))
+
+def build_quickanswers_prompt(case_title: str, case_description: str, questions: List[str]) -> str:
+    q_lines = "\n".join([f"- {q}" for q in questions])
+    return f"""
+Du bist der PATIENT in einem neurologischen Trainingsfall.
+Der Arzt stellt typische Anamnesefragen. Du antwortest wie ein echter Patient, in Alltagssprache.
+
+REGELN:
+- Nutze AUSSCHLIESSLICH Informationen aus dem Falltext.
+- Erfinde nichts dazu.
+- Wenn es nicht im Falltext steht: "Das weiß ich nicht" / "Dazu kann ich nichts sagen".
+- Keine Diagnosen, keine Fachbegriffe.
+- Kurz: 1–2 Sätze pro Antwort.
+
+FALL:
+Titel: {case_title}
+
+Fallbeschreibung (Ground Truth):
+{case_description}
+
+AUFGABE:
+Beantworte die folgenden Fragen:
+
+{q_lines}
+
+OUTPUT:
+Gib NUR gültiges JSON zurück:
+[
+  {{"q":"...","a":"..."}},
+  ...
+]
+""".strip()
+
+
+def generate_quickanswers(case_title: str, case_description: str, model_name: str) -> List[Dict[str, str]]:
+    prompt = build_quickanswers_prompt(case_title, case_description, TYPICAL_QUESTIONS)
+
+    # ✅ WICHTIG: KEIN temperature setzen (sonst dein Fehler)
+    completion = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}],
+    )
+
+    text = (completion.choices[0].message.content or "").strip()
+
+    data = None
+    try:
+        data = json.loads(text)
+    except Exception:
+        start = text.find("[")
+        end = text.rfind("]")
+        if start != -1 and end != -1 and end > start:
+            try:
+                data = json.loads(text[start:end+1])
+            except Exception:
+                data = None
+
+    cleaned: List[Dict[str, str]] = []
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            q = str(item.get("q", "")).strip()
+            a = str(item.get("a", "")).strip()
+            if q and a:
+                cleaned.append({"q": q, "a": a})
+
+    if not cleaned:
+        cleaned = [{"q": q, "a": "Das weiß ich nicht."} for q in TYPICAL_QUESTIONS]
+
+    return cleaned
 
 
 def build_coach_prompt(case_title: str, case_description: str, history: List[Dict[str, str]]) -> str:
@@ -957,6 +1040,48 @@ async def duo_doctor_chat(req: DuoChatRequest, db: Session = Depends(get_db)):
             usage=None,
             limit=limit
         )
+
+@app.post("/duo/quickanswers/create", response_model=QuickAnswersResponse)
+async def duo_quickanswers_create(payload: QuickAnswersCreatePayload, db: Session = Depends(get_db)):
+    s = db.query(DuoSession).filter(DuoSession.session_id == payload.sessionId).first()
+    if not s:
+        raise HTTPException(status_code=404, detail="Session nicht gefunden")
+    if s.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=410, detail="Session abgelaufen")
+
+    if not s.case_title or not s.case_description:
+        raise HTTPException(status_code=400, detail="Fall ist in der Session noch nicht gesetzt")
+
+    # ✅ Cache: wenn schon da, direkt zurück (ohne neues Usage)
+    cached = ws_manager.quickanswers.get(payload.sessionId)
+    if cached and len(cached) > 0:
+        user = get_or_create_user(db, payload.userId)
+        apply_month_reset(user)
+        limit = get_limit_for_plan(user.plan)
+        return QuickAnswersResponse(sessionId=payload.sessionId, items=cached, usage=user.monthly_usage, limit=limit)
+
+    user = get_or_create_user(db, payload.userId)
+    apply_month_reset(user)
+
+    plan = user.plan
+    limit = get_limit_for_plan(plan)
+    if user.monthly_usage >= limit:
+        raise HTTPException(status_code=403, detail="Limit erreicht")
+
+    model_name = get_model_for_plan(plan)
+
+    items = generate_quickanswers(s.case_title, s.case_description, model_name=model_name)
+
+    # ✅ Cache speichern
+    ws_manager.quickanswers[payload.sessionId] = items
+
+    # ✅ Button zählt genau 1×
+    user.monthly_usage += 1
+    db.commit()
+    db.refresh(user)
+
+    return QuickAnswersResponse(sessionId=payload.sessionId, items=items, usage=user.monthly_usage, limit=limit)
+
 
 # -------------------------------------------------------
 # NEW: Duo Session REST (iPad erstellt, iPhone joint)

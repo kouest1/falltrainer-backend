@@ -388,7 +388,6 @@ def generate_quick_answers_with_openai(case_title: str, case_description: str, m
     completion = client.chat.completions.create(
         model=model_name,
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.2,
     )
 
     text = (completion.choices[0].message.content or "").strip()

@@ -334,6 +334,94 @@ class WSManager:
 
 ws_manager = WSManager()
 
+# =========================
+# ✅ Quick Answers (Session Cache + KI Generator)
+# =========================
+
+# ✅ Hier legst du die "typischen Fragen" MANUELL fest:
+TYPICAL_QUESTIONS: list[str] = [
+    "Seit wann bestehen die Beschwerden?",
+    "Wie haben die Beschwerden begonnen (plötzlich oder schleichend)?",
+    "Wo genau ist das Problem / welche Körperregion ist betroffen?",
+    "Wie würden Sie das Gefühl beschreiben (Schmerz, Taubheit, Schwäche, Schwindel, Sehstörung)?",
+    "Wie stark ist es (Skala 0–10)?",
+    "Gibt es Auslöser oder Besserung/Verschlechterung?",
+    "Gab es ähnliche Episoden früher?",
+    "Gibt es Begleitsymptome (Übelkeit, Fieber, Bewusstseinsstörung, Sprachstörung, Sehstörung)?",
+    "Welche Vorerkrankungen haben Sie?",
+    "Welche Medikamente nehmen Sie regelmäßig?",
+    "Allergien?",
+    "Rauchen/Alkohol/Drogen?",
+]
+
+# ✅ Session-Cache im WSManager erweitern (ohne deine Klasse zu ändern):
+# Wir hängen einfach Attribute dran.
+if not hasattr(ws_manager, "quick_answers"):
+    ws_manager.quick_answers: Dict[str, List[Dict[str, str]]] = {}  # session_id -> [{"q": "...", "a": "..."}]
+
+def build_quick_answers_prompt(case_title: str, case_description: str, questions: list[str]) -> str:
+    qs = "\n".join([f"- {q}" for q in questions])
+    return (
+        "Du spielst den PATIENTEN in einem neurologischen Trainingsgespräch.\n"
+        "Der Arzt stellt typische Fragen. Du kennst den Falltext, der Arzt nicht.\n\n"
+        "REGELN:\n"
+        "- Antworte wie ein echter Patient: normale Alltagssprache, keine Fachbegriffe.\n"
+        "- Keine Diagnosen, keine Erklärungen.\n"
+        "- Nutze nur Informationen, die im Falltext stehen. Erfinde nichts.\n"
+        "- Wenn es nicht im Falltext steht: antworte ehrlich 'Das weiß ich nicht.'\n"
+        "- Pro Antwort 1–2 kurze Sätze.\n\n"
+        f"FALLTITEL: {case_title}\n\n"
+        f"FALLTEXT (Ground Truth):\n{case_description}\n\n"
+        "AUFGABE:\n"
+        "Erstelle einen Stichwortbogen als JSON.\n"
+        "Gib AUSSCHLIESSLICH JSON zurück (keinen Fließtext, keine Markdown-Fences).\n"
+        "Format:\n"
+        "[{\"q\":\"<Frage>\",\"a\":\"<Patientenantwort>\"}, ...]\n\n"
+        "TYPISCHE FRAGEN:\n"
+        f"{qs}\n"
+    )
+
+def generate_quick_answers_with_openai(case_title: str, case_description: str, model_name: str) -> List[Dict[str, str]]:
+    prompt = build_quick_answers_prompt(case_title, case_description, TYPICAL_QUESTIONS)
+
+    # Chat Completions -> wir erzwingen JSON so gut es geht über prompt + temperature low-ish
+    completion = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.2,
+    )
+
+    text = (completion.choices[0].message.content or "").strip()
+
+    # Versuche JSON zu parsen
+    try:
+        data = json.loads(text)
+    except Exception:
+        # Fallback: manchmal kommt Text drumherum -> best effort JSON-Extraktion
+        start = text.find("[")
+        end = text.rfind("]")
+        if start != -1 and end != -1 and end > start:
+            data = json.loads(text[start:end+1])
+        else:
+            raise RuntimeError("QuickAnswers: Konnte JSON nicht parsen")
+
+    # Validieren/normalisieren
+    cleaned: List[Dict[str, str]] = []
+    if isinstance(data, list):
+        for item in data:
+            if not isinstance(item, dict):
+                continue
+            q = str(item.get("q", "")).strip()
+            a = str(item.get("a", "")).strip()
+            if q and a:
+                cleaned.append({"q": q, "a": a})
+
+    # Fallback: falls KI Mist liefert, bauen wir minimal etwas
+    if not cleaned:
+        cleaned = [{"q": q, "a": "Das weiß ich nicht."} for q in TYPICAL_QUESTIONS]
+
+    return cleaned
+
 
 def generate_join_code(length: int = 6) -> str:
     alphabet = string.ascii_uppercase + string.digits
@@ -1013,6 +1101,81 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                 continue
 
             msg_type = data.get("type")
+
+            # =========================
+            # ✅ Quick Answers anfordern (Patient UI Button)
+            # Client sendet: {"type":"request_quick_answers"} optional {"force": true}
+            # Server antwortet: {"type":"quick_answers", "items":[{"q":"...","a":"..."}], "usage": X, "limit": Y}
+            # =========================
+            if msg_type == "request_quick_answers":
+                force = bool(data.get("force", False))
+
+                # nur im Live sinnvoll (case muss vorhanden sein)
+                if not s.case_title or not s.case_description:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "Kein Falltext vorhanden (case_title/case_description fehlen)."
+                    }))
+                    continue
+
+                # Cache-Hit -> sofort zurück (ohne Usage zu zählen)
+                cached = ws_manager.quick_answers.get(session_id)
+                if cached and not force:
+                    await websocket.send_text(json.dumps({
+                        "type": "quick_answers",
+                        "items": cached
+                    }, ensure_ascii=False))
+                    continue
+
+                # Usage zählen: derjenige, der klickt (Patient)
+                user = get_or_create_user(db, user_id)
+                apply_month_reset(user)
+                plan = user.plan
+                limit = get_limit_for_plan(plan)
+
+                if user.monthly_usage >= limit:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "Limit erreicht",
+                        "usage": user.monthly_usage,
+                        "limit": limit
+                    }, ensure_ascii=False))
+                    continue
+
+                # ✅ 1x Usage für Generierung
+                user.monthly_usage += 1
+                db.commit()
+                db.refresh(user)
+
+                model_name = get_model_for_plan(plan)
+
+                try:
+                    items = generate_quick_answers_with_openai(
+                        case_title=s.case_title,
+                        case_description=s.case_description,
+                        model_name=model_name
+                    )
+                except Exception as e:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": f"QuickAnswers Fehler: {repr(e)}",
+                        "usage": user.monthly_usage,
+                        "limit": limit
+                    }, ensure_ascii=False))
+                    continue
+
+                # Cache speichern
+                ws_manager.quick_answers[session_id] = items
+
+                # Antwort an diesen Client
+                await websocket.send_text(json.dumps({
+                    "type": "quick_answers",
+                    "items": items,
+                    "usage": user.monthly_usage,
+                    "limit": limit
+                }, ensure_ascii=False))
+                continue
+
 
             # ✅ Doctor kann Case setzen
             if msg_type == "init_case" and role == "doctor":

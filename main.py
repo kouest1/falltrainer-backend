@@ -443,75 +443,6 @@ def generate_join_code(length: int = 6) -> str:
     alphabet = string.ascii_uppercase + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
-def build_quickanswers_prompt(case_title: str, case_description: str, questions: List[str]) -> str:
-    q_lines = "\n".join([f"- {q}" for q in questions])
-    return f"""
-Du bist der PATIENT in einem neurologischen Trainingsfall.
-Der Arzt stellt typische Anamnesefragen. Du antwortest wie ein echter Patient, in Alltagssprache.
-
-REGELN:
-- Nutze AUSSCHLIESSLICH Informationen aus dem Falltext.
-- Erfinde nichts dazu.
-- Wenn es nicht im Falltext steht: "Das weiß ich nicht" / "Dazu kann ich nichts sagen".
-- Keine Diagnosen, keine Fachbegriffe.
-- Kurz: 1–2 Sätze pro Antwort.
-
-FALL:
-Titel: {case_title}
-
-Fallbeschreibung (Ground Truth):
-{case_description}
-
-AUFGABE:
-Beantworte die folgenden Fragen:
-
-{q_lines}
-
-OUTPUT:
-Gib NUR gültiges JSON zurück:
-[
-  {{"q":"...","a":"..."}},
-  ...
-]
-""".strip()
-
-
-
-    # ✅ WICHTIG: KEIN temperature setzen (sonst dein Fehler)
-    completion = client.chat.completions.create(
-        model=model_name,
-        messages=[{"role": "user", "content": prompt}],
-    )
-
-    text = (completion.choices[0].message.content or "").strip()
-
-    data = None
-    try:
-        data = json.loads(text)
-    except Exception:
-        start = text.find("[")
-        end = text.rfind("]")
-        if start != -1 and end != -1 and end > start:
-            try:
-                data = json.loads(text[start:end+1])
-            except Exception:
-                data = None
-
-    cleaned: List[Dict[str, str]] = []
-    if isinstance(data, list):
-        for item in data:
-            if not isinstance(item, dict):
-                continue
-            q = str(item.get("q", "")).strip()
-            a = str(item.get("a", "")).strip()
-            if q and a:
-                cleaned.append({"q": q, "a": a})
-
-    if not cleaned:
-        cleaned = [{"q": q, "a": "Das weiß ich nicht."} for q in TYPICAL_QUESTIONS]
-
-    return cleaned
-
 
 def build_coach_prompt(case_title: str, case_description: str, history: List[Dict[str, str]]) -> str:
     system_prompt = (
@@ -1222,15 +1153,18 @@ async def ws_duo(session_id: str, websocket: WebSocket):
         # -------------------------------------------------
         # MAIN RECEIVE LOOP
         # -------------------------------------------------
-        while True:
-            raw = await websocket.receive_text()
-            print("[WS] RAW:", raw)
- 
-           try:
-                data = json.loads(raw)
-            except Exception:
-                await websocket.send_text(json.dumps({"type": "error", "message": "Invalid JSON"}, ensure_ascii=False))
-                continue
+while True:
+    raw = await websocket.receive_text()
+    print("[WS] RAW:", raw)
+
+    try:
+        data = json.loads(raw)
+    except Exception:
+        await websocket.send_text(json.dumps(
+            {"type": "error", "message": "Invalid JSON"},
+            ensure_ascii=False
+        ))
+        continue
 
             msg_type = data.get("type")
 

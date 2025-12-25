@@ -350,7 +350,6 @@ ws_manager = WSManager()
 # ✅ Quick Answers (Session Cache + KI Generator)
 # =========================
 
-# ✅ Hier legst du die "typischen Fragen" MANUELL fest:
 TYPICAL_QUESTIONS: list[str] = [
     "Seit wann bestehen die Beschwerden?",
     "Wie haben die Beschwerden begonnen (plötzlich oder schleichend)?",
@@ -401,10 +400,10 @@ Gib NUR gültiges JSON zurück (ohne Text drumherum):
 def generate_quickanswers(case_title: str, case_description: str, model_name: str) -> List[Dict[str, str]]:
     prompt = build_quickanswers_prompt(case_title, case_description, TYPICAL_QUESTIONS)
 
-    # ✅ WICHTIG: KEIN temperature setzen (bei manchen Modellen nicht erlaubt)
     completion = client.chat.completions.create(
         model=model_name,
         messages=[{"role": "user", "content": prompt}],
+        # kein temperature -> kompatibler
     )
 
     text = (completion.choices[0].message.content or "").strip()
@@ -1225,7 +1224,9 @@ async def ws_duo(session_id: str, websocket: WebSocket):
         # -------------------------------------------------
         while True:
             raw = await websocket.receive_text()
-            try:
+            print("[WS] RAW:", raw)
+ 
+           try:
                 data = json.loads(raw)
             except Exception:
                 await websocket.send_text(json.dumps({"type": "error", "message": "Invalid JSON"}, ensure_ascii=False))

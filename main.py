@@ -1098,10 +1098,6 @@ async def duo_session_join(payload: DuoSessionJoinPayload, db: Session = Depends
 #   wss://HOST/ws/duo/{sessionId}?role=patient&userId=...
 # -------------------------------------------------------
 
-from fastapi import WebSocket, WebSocketDisconnect
-from datetime import datetime
-import json
-
 @app.websocket("/ws/duo/{session_id}")
 async def ws_duo(session_id: str, websocket: WebSocket):
     # ✅ accept GENAU EINMAL – hier!
@@ -1153,18 +1149,18 @@ async def ws_duo(session_id: str, websocket: WebSocket):
         # -------------------------------------------------
         # MAIN RECEIVE LOOP
         # -------------------------------------------------
-while True:
-    raw = await websocket.receive_text()
-    print("[WS] RAW:", raw)
+        while True:
+            raw = await websocket.receive_text()
+            print("[WS] RAW:", raw)
 
-    try:
-        data = json.loads(raw)
-    except Exception:
-        await websocket.send_text(json.dumps(
-            {"type": "error", "message": "Invalid JSON"},
-            ensure_ascii=False
-        ))
-        continue
+            try:
+                data = json.loads(raw)
+            except Exception:
+                await websocket.send_text(json.dumps(
+                    {"type": "error", "message": "Invalid JSON"},
+                    ensure_ascii=False
+                ))
+                continue
 
             msg_type = data.get("type")
 
@@ -1177,7 +1173,6 @@ while True:
                 force = bool(data.get("force", False))
                 print(f"[WS] request_quick_answers session={session_id} force={force} by user={user_id}")
 
-                # Case muss vorhanden sein, sonst kann KI nichts fallbezogen machen
                 if not s.case_title or not s.case_description:
                     await websocket.send_text(json.dumps({
                         "type": "error",
@@ -1185,7 +1180,6 @@ while True:
                     }, ensure_ascii=False))
                     continue
 
-                # Cache-Hit -> sofort zurück (ohne Usage zu zählen)
                 cached = ws_manager.quickanswers.get(session_id)
                 if cached and not force:
                     await websocket.send_text(json.dumps({
@@ -1195,7 +1189,6 @@ while True:
                     print(f"[WS] quick_answers cache-hit session={session_id} items={len(cached)}")
                     continue
 
-                # Usage zählen: derjenige, der klickt
                 user = get_or_create_user(db, user_id)
                 apply_month_reset(user)
                 plan = user.plan
@@ -1210,7 +1203,6 @@ while True:
                     }, ensure_ascii=False))
                     continue
 
-                # ✅ 1x Usage für Generierung
                 user.monthly_usage += 1
                 db.commit()
                 db.refresh(user)
@@ -1218,7 +1210,6 @@ while True:
                 model_name = get_model_for_plan(plan)
 
                 try:
-                    # ✅ nutzt den sauberen Generator aus deinem ersetzten Block
                     items = generate_quickanswers(
                         case_title=s.case_title,
                         case_description=s.case_description,
@@ -1233,11 +1224,9 @@ while True:
                     }, ensure_ascii=False))
                     continue
 
-                # Cache speichern
                 ws_manager.quickanswers[session_id] = items
                 print(f"[WS] quick_answers generated session={session_id} items={len(items)} usage={user.monthly_usage}/{limit}")
 
-                # Antwort an diesen Client
                 await websocket.send_text(json.dumps({
                     "type": "quick_answers",
                     "items": items,
@@ -1254,11 +1243,7 @@ while True:
                 s.case_description = data.get("caseDescription") or s.case_description
                 db.commit()
 
-                # Beim neuen Fall: QuickAnswers Cache leeren (sonst alte Antworten)
-                try:
-                    ws_manager.quickanswers.pop(session_id, None)
-                except Exception:
-                    pass
+                ws_manager.quickanswers.pop(session_id, None)
 
                 await ws_manager.broadcast(session_id, "doctor", {"type": "status", "message": "Case gespeichert"})
                 await ws_manager.broadcast(session_id, "patient", {"type": "status", "message": "Case gespeichert"})
@@ -1292,7 +1277,6 @@ while True:
 
                 await ws_manager.broadcast(session_id, "doctor", {"type": "patient_text", "text": text})
 
-                # OPTIONAL: Auto-Coach (nur wenn case vorhanden & doctor bekannt)
                 if s.doctor_user_id and s.case_title and s.case_description:
                     doctor = get_or_create_user(db, s.doctor_user_id)
                     apply_month_reset(doctor)
@@ -1309,7 +1293,6 @@ while True:
                         })
                         continue
 
-                    # ✅ 1x Usage für Coach Suggestion
                     doctor.monthly_usage += 1
                     db.commit()
                     db.refresh(doctor)
@@ -1323,9 +1306,7 @@ while True:
 
                     try:
                         resp = client.responses.create(model=model_name, input=coach_prompt)
-                        reply_text = extract_text_from_responses_api(resp).strip()
-                        if not reply_text:
-                            reply_text = "Ich habe gerade keinen guten Vorschlag."
+                        reply_text = extract_text_from_responses_api(resp).strip() or "Ich habe gerade keinen guten Vorschlag."
                     except Exception as e:
                         print("Coach WS error:", repr(e))
                         reply_text = "Technischer Fehler beim Coach."
@@ -1339,20 +1320,21 @@ while True:
 
                 continue
 
-            # =========================
-            # Unknown
-            # =========================
-            await websocket.send_text(json.dumps({"type": "error", "message": "Unknown event type"}, ensure_ascii=False))
+            await websocket.send_text(json.dumps(
+                {"type": "error", "message": "Unknown event type"},
+                ensure_ascii=False
+            ))
 
     except WebSocketDisconnect:
         print(f"[WS] disconnected session={session_id} role={role} user={user_id}")
-        pass
     finally:
         try:
             ws_manager.disconnect(session_id, role, websocket)
         except Exception:
             pass
         db.close()
+
+
 
 
 

@@ -1275,10 +1275,10 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                 ws_manager.history.setdefault(session_id, [])
                 ws_manager.history[session_id].append({"role": "patient", "content": text})
                         
-                # 1. Nachricht an den Arzt weiterleiten
+                # 1. Nachricht sofort senden
                 await ws_manager.broadcast(session_id, "doctor", {"type": "patient_text", "text": text})
                         
-                # 2. Coach-Vorschlag generieren
+                # 2. Coach (optional)
                 try:
                     if s.doctor_user_id and s.case_title and s.case_description:
                         doctor = get_or_create_user(db, s.doctor_user_id)
@@ -1293,13 +1293,8 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                             db.refresh(doctor)
                     
                             model_name = get_model_for_plan(plan)
-                            coach_prompt = build_coach_prompt(
-                                s.case_title,
-                                s.case_description,
-                                ws_manager.history[session_id]
-                            )
+                            coach_prompt = build_coach_prompt(s.case_title, s.case_description, ws_manager.history[session_id])
                     
-                            # ✅ Nutzt call_openai
                             reply_text = call_openai(coach_prompt, model_name=model_name).strip()
                             
                             if reply_text:
@@ -1310,40 +1305,18 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                                     "limit": limit
                                 })
                 except Exception as e:
-                    print(f"Coach Fehler: {repr(e)}")
+                    print(f"Coach-Fehler: {e}")
                 
-                # WICHTIG: Das continue muss auf der Ebene des 'if msg_type' stehen
-                continue                    doctor.monthly_usage += 1
-                    db.commit()
-                    db.refresh(doctor)
-
-                    model_name = get_model_for_plan(plan)
-                    coach_prompt = build_coach_prompt(
-                        s.case_title,
-                        s.case_description,
-                        ws_manager.history[session_id]
-                    )
-
-                    try:
-                        resp = client.responses.create(model=model_name, input=coach_prompt)
-                        reply_text = extract_text_from_responses_api(resp).strip() or "Ich habe gerade keinen guten Vorschlag."
-                    except Exception as e:
-                        print("Coach WS error:", repr(e))
-                        reply_text = "Technischer Fehler beim Coach."
-
-                    await ws_manager.broadcast(session_id, "doctor", {
-                        "type": "coach_suggestion",
-                        "text": reply_text,
-                        "usage": doctor.monthly_usage,
-                        "limit": limit
-                    })
-
+                # Das continue beendet den aktuellen Schleifendurchlauf für 'patient_text'
                 continue
 
-            await websocket.send_text(json.dumps(
-                {"type": "error", "message": "Unknown event type"},
-                ensure_ascii=False
-            ))
+            # --- Ende des Patienten-Blocks ---
+
+            # Dieser Teil darf erst kommen, wenn KEINES der obigen 'if' (doctor_text, patient_text) zutraf
+            await websocket.send_text(json.dumps({
+                "type": "error", 
+                "message": "Unknown event type"
+            }, ensure_ascii=False))
 
     except WebSocketDisconnect:
         print(f"[WS] disconnected session={session_id} role={role} user={user_id}")
@@ -1353,7 +1326,6 @@ async def ws_duo(session_id: str, websocket: WebSocket):
         except Exception:
             pass
         db.close()
-
 
 
 

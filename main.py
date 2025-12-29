@@ -351,18 +351,18 @@ ws_manager = WSManager()
 # =========================
 
 TYPICAL_QUESTIONS: list[str] = [
-    "Seit wann bestehen die Beschwerden?",
-    "Wie haben die Beschwerden begonnen (plötzlich oder schleichend)?",
+    "Was führt sie zu uns?",
+    "Wie haben die Beschwerden begonnen (plötzlich oder schleichend),und seit wann bestehen die Beschwerden?",
     "Wo genau ist das Problem / welche Körperregion ist betroffen?",
     "Wie würden Sie das Gefühl beschreiben (Schmerz, Taubheit, Schwäche, Schwindel, Sehstörung)?",
     "Wie stark ist es (Skala 0–10)?",
     "Gibt es Auslöser oder Besserung/Verschlechterung?",
     "Gab es ähnliche Episoden früher?",
-    "Gibt es Begleitsymptome (Übelkeit, Fieber, Bewusstseinsstörung, Sprachstörung, Sehstörung)?",
-    "Welche Vorerkrankungen haben Sie?",
-    "Welche Medikamente nehmen Sie regelmäßig?",
+    "Gibt es Begleitsymptome (Übelkeit, Fieber, Bewusstseinsstörung, Gewichtsverlust)?",
+    "Welche Vorerkrankungen haben Sie, nehmen sie Medikamente?",
+    "Ist in der Familie eine Erkrankung bekannt?",
     "Allergien?",
-    "Rauchen/Alkohol/Drogen?",
+    "Rauchen/Alkohol/Drogen/Sport?",
 ]
 
 def build_quickanswers_prompt(case_title: str, case_description: str, questions: List[str]) -> str:
@@ -1264,35 +1264,52 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                 await ws_manager.broadcast(session_id, "patient", {"type": "doctor_text", "text": text})
                 continue
 
-            # =========================
-            # ✅ Patient -> Doctor (+ optional Coach)
-            # =========================
-            if msg_type == "patient_text" and role == "patient":
-                text = (data.get("text") or "").strip()
-                if not text:
-                    continue
-
-                ws_manager.history.setdefault(session_id, [])
-                ws_manager.history[session_id].append({"role": "patient", "content": text})
-
-                await ws_manager.broadcast(session_id, "doctor", {"type": "patient_text", "text": text})
-
-                if s.doctor_user_id and s.case_title and s.case_description:
-                    doctor = get_or_create_user(db, s.doctor_user_id)
-                    apply_month_reset(doctor)
-
-                    plan = doctor.plan
-                    limit = get_limit_for_plan(plan)
-
-                    if doctor.monthly_usage >= limit:
-                        await ws_manager.broadcast(session_id, "doctor", {
-                            "type": "error",
-                            "message": "Limit erreicht",
-                            "usage": doctor.monthly_usage,
-                            "limit": limit
-                        })
-                        continue
-
+# =========================
+# ✅ Patient -> Doctor (+ optional Coach)
+# =========================
+if msg_type == "patient_text" and role == "patient":
+    text = (data.get("text") or "").strip()
+    if not text:
+        continue
+         
+    # 1. In der Historie speichern
+    ws_manager.history.setdefault(session_id, [])
+    ws_manager.history[session_id].append({"role": "patient", "content": text})
+            
+    # 2. Nachricht SOFORT an den Arzt senden (bevor die KI rechnet!)
+    await ws_manager.broadcast(session_id, "doctor", {"type": "patient_text", "text": text})
+            
+    # 3. Coach-Vorschlag (KI) in einem eigenen Try-Block, damit der Chat nicht abstürzt
+    try:
+        if s.doctor_user_id and s.case_title and s.case_description:
+            doctor = get_or_create_user(db, s.doctor_user_id)
+            apply_month_reset(doctor)
+    
+            plan = doctor.plan
+            limit = get_limit_for_plan(plan)
+    
+            if doctor.monthly_usage < limit:
+                doctor.monthly_usage += 1
+                db.commit()
+                db.refresh(doctor)
+        
+                model_name = get_model_for_plan(plan)
+                coach_prompt = build_coach_prompt(s.case_title, s.case_description, ws_manager.history[session_id])
+        
+                # ✅ Korrigierter Aufruf über deine Hilfsfunktion
+                reply_text = call_openai(coach_prompt, model_name=model_name).strip()
+                
+                if reply_text:
+                    await ws_manager.broadcast(session_id, "doctor", {
+                        "type": "coach_suggestion",
+                        "text": reply_text,
+                        "usage": doctor.monthly_usage,
+                        "limit": limit
+                    })
+    except Exception as e:
+        print(f"Coach-Fehler (Chat läuft weiter): {e}")
+    
+    continue
                     doctor.monthly_usage += 1
                     db.commit()
                     db.refresh(doctor)

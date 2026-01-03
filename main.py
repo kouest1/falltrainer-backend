@@ -3,6 +3,7 @@ import json
 import uuid
 import secrets
 import string
+import time
 from datetime import datetime, timedelta
 from typing import List, Literal, Optional, Dict, Any
 
@@ -28,7 +29,7 @@ class DuoSession(Base):
     session_id = Column(String, primary_key=True)               # uuid string
     join_code = Column(String, unique=True, index=True, nullable=False)
 
-    doctor_user_id = Column(String, index=True, nullable=False)
+    doctor_user_id = Column(String, index=True, nullable=True)  # ✅ FIX: nullable=True (Doctor kommt später)
     patient_user_id = Column(String, index=True, nullable=True)
 
     case_title = Column(String, nullable=True)
@@ -120,18 +121,6 @@ def call_openai_stream(message: str, model_name: str):
             yield delta
 
 
-
-
-def extract_text_from_responses_api(resp) -> str:
-    """
-    Holt Text aus OpenAI Responses API Antwort, mit Fallbacks.
-    """
-    try:
-        return resp.output[0].content[0].text or ""
-    except Exception:
-        return getattr(resp, "output_text", "") or str(resp)
-
-
 # -------------------------------------------------------
 # User + Plan Logik
 # -------------------------------------------------------
@@ -166,6 +155,10 @@ def apply_month_reset(user: User):
 
 app = FastAPI()
 APPLE_KEYS_URL = "https://appleid.apple.com/auth/keys"
+
+# ✅ FIX: Apple Public Key Caching (1 Stunde)
+_apple_keys_cache = None
+_apple_keys_cache_time = None
 
 
 # -------------------------------------------------------
@@ -294,12 +287,20 @@ class QuickAnswersResponse(BaseModel):
 
 
 # -------------------------------------------------------
-# Helper für Apple Public Key
+# Helper für Apple Public Key (mit Caching)
 # -------------------------------------------------------
 
 def get_apple_public_key(kid: str):
-    apple_keys = requests.get(APPLE_KEYS_URL).json()["keys"]
-    for key in apple_keys:
+    """✅ FIX: Apple Public Keys werden gecacht (1 Stunde)"""
+    global _apple_keys_cache, _apple_keys_cache_time
+    now = time.time()
+    
+    # Cache für 1 Stunde
+    if _apple_keys_cache is None or (now - _apple_keys_cache_time) > 3600:
+        _apple_keys_cache = requests.get(APPLE_KEYS_URL).json()["keys"]
+        _apple_keys_cache_time = now
+    
+    for key in _apple_keys_cache:
         if key["kid"] == kid:
             return key
     raise Exception("Apple Public Key nicht gefunden")
@@ -522,6 +523,15 @@ async def validate_receipt(payload: ReceiptPayload, db: Session = Depends(get_db
     user_id = payload.userId
     receipt_data = payload.receipt
 
+    # ✅ FIX: App Store Shared Secret aus Environment-Variable
+    # Nur erforderlich, wenn dieser Endpoint verwendet wird (für In-App-Käufe)
+    app_store_secret = os.getenv("APP_STORE_SHARED_SECRET", "")
+    if not app_store_secret:
+        raise HTTPException(
+            status_code=500, 
+            detail="APP_STORE_SHARED_SECRET nicht gesetzt. Für lokale Tests ohne Receipt-Validation nicht erforderlich."
+        )
+
     # Sandbox-Endpoint für Tests
     APPLE_VERIFY_URL = "https://sandbox.itunes.apple.com/verifyReceipt"
 
@@ -529,7 +539,7 @@ async def validate_receipt(payload: ReceiptPayload, db: Session = Depends(get_db
         APPLE_VERIFY_URL,
         json={
             "receipt-data": receipt_data,
-            "password": "DEIN_APP_STORE_SHARED_SECRET",  # TODO: echtes Shared Secret
+            "password": app_store_secret,
         },
     )
 
@@ -616,12 +626,13 @@ async def ask(payload: AskPayload, db: Session = Depends(get_db)):
 
     try:
         reply = call_openai(message, model_name=model_name)
+        # ✅ FIX: Usage erst NACH erfolgreichem OpenAI-Call
+        user.monthly_usage += 1
+        db.commit()
+        db.refresh(user)
     except Exception as e:
+        db.rollback()  # ✅ FIX: Rollback bei Fehler
         raise HTTPException(status_code=500, detail=f"Fehler bei KI-Anfrage: {e}")
-
-    user.monthly_usage += 1
-    db.commit()
-    db.refresh(user)
 
     return AskResponse(
         reply=reply,
@@ -686,43 +697,14 @@ async def load_notes(payload: NotesLoadPayload, db: Session = Depends(get_db)):
 async def save_note(payload: NoteUpdatePayload, db: Session = Depends(get_db)):
     user = get_or_create_user(db, payload.userId)
 
-    # Falls der Falltitel im Payload steckt (empfohlen)
-    case_title = getattr(payload, "caseTitle", None) or getattr(payload, "case_title", None) or ""
-
-    prompt = (
-        "Du spielst in diesem Chat den PATIENTEN in einem neurologischen Trainingsgespräch. "
-        "Der Benutzer ist der Arzt.\n\n"
-        "WICHTIG:\n"
-        "- Sprich so, wie ein echter Patient sprechen würde: ganz normale Alltagssprache.\n"
-        "- Keine medizinischen Fachbegriffe, keine Diagnosen, keine Erklärungen.\n"
-        "- Antworte nur mit Informationen, die im Falltext stehen. Erfinde nichts dazu.\n"
-        "- Wenn du etwas nicht weißt oder es nicht im Falltext steht, sag ehrlich: "
-        "\"Das weiß ich nicht\" oder \"Dazu kann ich nichts sagen\".\n"
-        "- Nenne keine Untersuchungs- oder Laborergebnisse (CT/MRT/EEG/Blut/LP usw.), "
-        "außer sie stehen ausdrücklich im Falltext.\n\n"
-        "SO SOLLST DU ANTWORTEN:\n"
-        "- In der Ich-Form (\"Ich …\"), freundlich, natürlich.\n"
-        "- Kurz und gut vorlesbar: meist 1–3 Sätze.\n"
-        "- Gib nur die Infos, nach denen der Arzt gerade fragt. Keine langen Monologe.\n"
-        "- Wenn mehrere Fragen kommen: nacheinander kurz beantworten.\n"
-        "- Wenn der Arzt ein Wort benutzt, das du nicht verstehst: frag zurück, z.B. "
-        "\"Was meinen Sie genau?\"\n\n"
-        "UNTERSUCHUNG:\n"
-        "- Wenn der Arzt dich bittet, etwas zu machen (z.B. Arme heben, auf einem Bein stehen): "
-        "reagiere wie ein Patient (was du dabei merkst).\n"
-        "- Sag objektive Befunde (z.B. \"Pupillen sind …\") nur, wenn sie im Falltext stehen.\n\n"
-        f"Falltitel: {case_title}\n"
-    )
-
+    # ✅ FIX: Unbenutzten Prompt entfernt, direkt Notes speichern
     # Notes laden (falls vorhanden)
-    notes = []
+    notes = {}  # ✅ FIX: Direkt als Dict initialisieren
     if user.notes:
         try:
             notes = json.loads(user.notes)
         except Exception:
-            notes = []
-    else:
-        notes = {}
+            notes = {}
 
     if not isinstance(notes, dict):
         notes = {}
@@ -799,23 +781,21 @@ async def duo_chat(req: DuoChatRequest, db: Session = Depends(get_db)):
     )
 
     try:
-        # ✅ Statt Responses-API: nutze deine vorhandene call_openai()-Funktion
         reply_text = call_openai(prompt, model_name=model_name).strip()
-
-        # ✅ Usage zählen (Duo zählt mit)
+        # ✅ FIX: Usage erst NACH erfolgreichem OpenAI-Call
         user.monthly_usage += 1
         db.commit()
         db.refresh(user)
-
-        return DuoChatResponse(reply=reply_text, usage=user.monthly_usage, limit=limit)
-
     except Exception as e:
+        db.rollback()  # ✅ FIX: Rollback bei Fehler
         print("Fehler in /duoChat:", repr(e))
         return DuoChatResponse(
             reply="Entschuldigung, ich kann gerade nicht gut antworten – es gab einen technischen Fehler.",
             usage=None,
             limit=limit,
         )
+
+    return DuoChatResponse(reply=reply_text, usage=user.monthly_usage, limit=limit)
 
 @app.post("/duoChatStream")
 async def duo_chat_stream(req: DuoChatRequest, db: Session = Depends(get_db)):
@@ -956,24 +936,24 @@ async def duo_doctor_chat(req: DuoChatRequest, db: Session = Depends(get_db)):
 
     try:
         reply_text = call_openai(prompt, model_name=model_name).strip()
-
+        # ✅ FIX: Usage erst NACH erfolgreichem OpenAI-Call
         user.monthly_usage += 1
         db.commit()
         db.refresh(user)
-
-        return DuoChatResponse(
-            reply=reply_text,
-            usage=user.monthly_usage,
-            limit=limit
-        )
-
     except Exception as e:
+        db.rollback()  # ✅ FIX: Rollback bei Fehler
         print("Fehler in /duoDoctorChat:", repr(e))
         return DuoChatResponse(
             reply="Ich kann gerade keine sinnvollen Vorschlaege machen - es gab einen technischen Fehler.",
             usage=None,
             limit=limit
         )
+
+    return DuoChatResponse(
+        reply=reply_text,
+        usage=user.monthly_usage,
+        limit=limit
+    )
 
 @app.post("/duo/quickanswers/create", response_model=QuickAnswersResponse)
 async def duo_quickanswers_create(payload: QuickAnswersCreatePayload, db: Session = Depends(get_db)):
@@ -1004,15 +984,18 @@ async def duo_quickanswers_create(payload: QuickAnswersCreatePayload, db: Sessio
 
     model_name = get_model_for_plan(plan)
 
-    items = generate_quickanswers(s.case_title, s.case_description, model_name=model_name)
+    try:
+        items = generate_quickanswers(s.case_title, s.case_description, model_name=model_name)
+        # ✅ FIX: Usage erst NACH erfolgreichem OpenAI-Call
+        user.monthly_usage += 1
+        db.commit()
+        db.refresh(user)
+    except Exception as e:
+        db.rollback()  # ✅ FIX: Rollback bei Fehler
+        raise HTTPException(status_code=500, detail=f"Fehler bei QuickAnswers-Generierung: {e}")
 
     # ✅ Cache speichern
     ws_manager.quickanswers[payload.sessionId] = items
-
-    # ✅ Button zählt genau 1×
-    user.monthly_usage += 1
-    db.commit()
-    db.refresh(user)
 
     return QuickAnswersResponse(sessionId=payload.sessionId, items=items, usage=user.monthly_usage, limit=limit)
 
@@ -1023,7 +1006,6 @@ async def duo_quickanswers_create(payload: QuickAnswersCreatePayload, db: Sessio
 
 @app.post("/duo/session/create", response_model=DuoSessionCreateResponse)
 async def duo_session_create(payload: DuoSessionCreatePayload, db: Session = Depends(get_db)):
-    # doctor session owner
     session_id = str(uuid.uuid4())
 
     # unique join code
@@ -1049,7 +1031,6 @@ async def duo_session_create(payload: DuoSessionCreatePayload, db: Session = Dep
         case_description=payload.caseDescription,
         created_at=now,
         expires_at=expires_at,
-
     )
 
     db.add(s)
@@ -1088,10 +1069,10 @@ async def duo_session_join(payload: DuoSessionJoinPayload, db: Session = Depends
 # -------------------------------------------------------
 # Client sendet JSON:
 #   { "type": "patient_text", "text": "..." }  (patient)
+#   { "type": "request_coach" }  (doctor) - ✅ NEU: Explizite Coach-Anfrage
 # Server broadcastet an doctor:
-#   { "type": "patient_text", "text": "...", "usage": X, "limit": Y }
-# Und automatisch:
-#   { "type": "coach_suggestion", "text": "...", "usage": X, "limit": Y }
+#   { "type": "patient_text", "text": "..." }
+#   { "type": "coach_suggestion", "text": "...", "usage": X, "limit": Y }  (nur auf request_coach)
 #
 # connect:
 #   wss://HOST/ws/duo/{sessionId}?role=doctor&userId=...
@@ -1166,8 +1147,6 @@ async def ws_duo(session_id: str, websocket: WebSocket):
 
             # =========================
             # ✅ Quick Answers anfordern (Patient UI Button)
-            # Client: {"type":"request_quick_answers", "force": true/false}
-            # Server: {"type":"quick_answers", "items":[{"q":"...","a":"..."}], "usage": X, "limit": Y}
             # =========================
             if msg_type == "request_quick_answers":
                 force = bool(data.get("force", False))
@@ -1203,19 +1182,19 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                     }, ensure_ascii=False))
                     continue
 
-                user.monthly_usage += 1
-                db.commit()
-                db.refresh(user)
-
-                model_name = get_model_for_plan(plan)
-
                 try:
+                    model_name = get_model_for_plan(plan)
                     items = generate_quickanswers(
                         case_title=s.case_title,
                         case_description=s.case_description,
                         model_name=model_name
                     )
+                    # ✅ FIX: Usage erst NACH erfolgreichem OpenAI-Call
+                    user.monthly_usage += 1
+                    db.commit()
+                    db.refresh(user)
                 except Exception as e:
+                    db.rollback()  # ✅ FIX: Rollback bei Fehler
                     await websocket.send_text(json.dumps({
                         "type": "error",
                         "message": f"QuickAnswers Fehler: {repr(e)}",
@@ -1233,6 +1212,61 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                     "usage": user.monthly_usage,
                     "limit": limit
                 }, ensure_ascii=False))
+                continue
+
+            # =========================
+            # ✅ NEU: Coach explizit anfordern (Doctor UI Button)
+            # =========================
+            if msg_type == "request_coach" and role == "doctor":
+                print(f"[WS] request_coach session={session_id} by user={user_id}")
+
+                if not s.case_title or not s.case_description:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "Kein Falltext vorhanden (case_title/case_description fehlen)."
+                    }, ensure_ascii=False))
+                    continue
+
+                user = get_or_create_user(db, user_id)
+                apply_month_reset(user)
+                plan = user.plan
+                limit = get_limit_for_plan(plan)
+
+                if user.monthly_usage >= limit:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "Limit erreicht",
+                        "usage": user.monthly_usage,
+                        "limit": limit
+                    }, ensure_ascii=False))
+                    continue
+
+                try:
+                    model_name = get_model_for_plan(plan)
+                    coach_prompt = build_coach_prompt(s.case_title, s.case_description, ws_manager.history.get(session_id, []))
+                    reply_text = call_openai(coach_prompt, model_name=model_name).strip()
+                    
+                    if reply_text:
+                        # ✅ FIX: Usage erst NACH erfolgreichem OpenAI-Call
+                        user.monthly_usage += 1
+                        db.commit()
+                        db.refresh(user)
+                        
+                        await websocket.send_text(json.dumps({
+                            "type": "coach_suggestion",
+                            "text": reply_text,
+                            "usage": user.monthly_usage,
+                            "limit": limit
+                        }, ensure_ascii=False))
+                except Exception as e:
+                    db.rollback()  # ✅ FIX: Rollback bei Fehler
+                    print(f"Coach-Fehler: {e}")
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": f"Coach-Fehler: {repr(e)}",
+                        "usage": user.monthly_usage,
+                        "limit": limit
+                    }, ensure_ascii=False))
                 continue
 
             # =========================
@@ -1264,8 +1298,8 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                 await ws_manager.broadcast(session_id, "patient", {"type": "doctor_text", "text": text})
                 continue
 
-# =========================
-            # ✅ Patient -> Doctor (+ optional Coach)
+            # =========================
+            # ✅ Patient -> Doctor (KEIN automatischer Coach mehr!)
             # =========================
             if msg_type == "patient_text" and role == "patient":
                 text = (data.get("text") or "").strip()
@@ -1275,44 +1309,13 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                 ws_manager.history.setdefault(session_id, [])
                 ws_manager.history[session_id].append({"role": "patient", "content": text})
                         
-                # 1. Nachricht sofort senden
+                # ✅ FIX: Nur Nachricht senden, KEIN automatischer Coach mehr!
                 await ws_manager.broadcast(session_id, "doctor", {"type": "patient_text", "text": text})
-                        
-                # 2. Coach (optional)
-                try:
-                    if s.doctor_user_id and s.case_title and s.case_description:
-                        doctor = get_or_create_user(db, s.doctor_user_id)
-                        apply_month_reset(doctor)
-                
-                        plan = doctor.plan
-                        limit = get_limit_for_plan(plan)
-                
-                        if doctor.monthly_usage < limit:
-                            doctor.monthly_usage += 1
-                            db.commit()
-                            db.refresh(doctor)
-                    
-                            model_name = get_model_for_plan(plan)
-                            coach_prompt = build_coach_prompt(s.case_title, s.case_description, ws_manager.history[session_id])
-                    
-                            reply_text = call_openai(coach_prompt, model_name=model_name).strip()
-                            
-                            if reply_text:
-                                await ws_manager.broadcast(session_id, "doctor", {
-                                    "type": "coach_suggestion",
-                                    "text": reply_text,
-                                    "usage": doctor.monthly_usage,
-                                    "limit": limit
-                                })
-                except Exception as e:
-                    print(f"Coach-Fehler: {e}")
-                
-                # Das continue beendet den aktuellen Schleifendurchlauf für 'patient_text'
                 continue
 
-            # --- Ende des Patienten-Blocks ---
+            # --- Ende der bekannten Message-Types ---
 
-            # Dieser Teil darf erst kommen, wenn KEINES der obigen 'if' (doctor_text, patient_text) zutraf
+            # Dieser Teil darf erst kommen, wenn KEINES der obigen 'if' zutraf
             await websocket.send_text(json.dumps({
                 "type": "error", 
                 "message": "Unknown event type"
@@ -1326,7 +1329,5 @@ async def ws_duo(session_id: str, websocket: WebSocket):
         except Exception:
             pass
         db.close()
-
-
 
 

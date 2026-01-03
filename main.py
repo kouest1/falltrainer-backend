@@ -189,6 +189,13 @@ class ReceiptResponse(BaseModel):
 class AskPayload(BaseModel):
     userId: str
     message: str
+    chatHistory: Optional[List[Dict[str, str]]] = None  # Optional: Chat-Verlauf für Kontext
+    caseTitle: Optional[str] = None  # Optional: Fall-Titel für Kontext
+    caseDescription: Optional[str] = None  # Optional: Fall-Beschreibung für Kontext
+    # Optional: Zusätzliche Fall-Informationen für Arzt-KI
+    questions: Optional[List[str]] = None
+    answers: Optional[List[str]] = None
+    extraInfo: Optional[str] = None
 
 
 class AskResponse(BaseModel):
@@ -230,6 +237,10 @@ class DuoChatRequest(BaseModel):
     caseTitle: str
     caseDescription: str
     messages: List[DuoMessage]
+    # Optional: Nur für Arzt-KI (nicht für Patienten-KI)
+    questions: Optional[List[str]] = None
+    answers: Optional[List[str]] = None
+    extraInfo: Optional[str] = None
 
 
 class DuoChatResponse(BaseModel):
@@ -268,6 +279,7 @@ class DuoSessionCreateResponse(BaseModel):
 class DuoSessionJoinPayload(BaseModel):
     userId: str
     joinCode: str
+    caseTitle: str  # Fall-Titel zur Überprüfung
 
 
 class DuoSessionJoinResponse(BaseModel):
@@ -292,6 +304,10 @@ class DiagnosisValidationPayload(BaseModel):
     caseDescription: str
     diagnosis: str
     history: List[DuoMessage]  # Bisheriger Dialog
+    # Optional: Zusätzliche Fall-Informationen für Arzt-KI
+    questions: Optional[List[str]] = None
+    answers: Optional[List[str]] = None
+    extraInfo: Optional[str] = None
 
 
 class DiagnosisValidationResponse(BaseModel):
@@ -310,6 +326,10 @@ class TherapyValidationPayload(BaseModel):
     diagnosis: str  # Die (korrekte) Diagnose
     therapy: str
     history: List[DuoMessage]  # Bisheriger Dialog
+    # Optional: Zusätzliche Fall-Informationen für Arzt-KI
+    questions: Optional[List[str]] = None
+    answers: Optional[List[str]] = None
+    extraInfo: Optional[str] = None
 
 
 class TherapyValidationResponse(BaseModel):
@@ -651,11 +671,14 @@ async def validate_transaction(payload: TransactionPayload, db: Session = Depend
     )
 
 
-# 3) KI-Frage stellen
+# 3) KI-Frage stellen (mit optionalem Chat-Verlauf)
 @app.post("/ask", response_model=AskResponse)
 async def ask(payload: AskPayload, db: Session = Depends(get_db)):
     user_id = payload.userId
     message = payload.message
+    chat_history = payload.chatHistory or []
+    case_title = payload.caseTitle
+    case_description = payload.caseDescription
 
     user = get_or_create_user(db, user_id)
     apply_month_reset(user)
@@ -669,7 +692,52 @@ async def ask(payload: AskPayload, db: Session = Depends(get_db)):
         raise HTTPException(status_code=403, detail="Limit erreicht")
 
     try:
-        reply = call_openai(message, model_name=model_name)
+        # Baue Kontext-Prompt mit Chat-Verlauf
+        messages = []
+        
+        # System-Prompt mit Fall-Informationen (wenn vorhanden)
+        system_prompt = "Du bist ein medizinischer Assistent, der Ärzte bei der Diagnose und Therapie unterstützt."
+        if case_title and case_description:
+            context_parts = [f"Titel: {case_title}", f"Beschreibung: {case_description}"]
+            
+            # Füge Fragen hinzu (wenn vorhanden)
+            if payload.questions:
+                questions_text = "\n".join([f"{i+1}. {q}" for i, q in enumerate(payload.questions)])
+                context_parts.append(f"Fragen zum Fall:\n{questions_text}")
+            
+            # Füge Antworten hinzu (wenn vorhanden)
+            if payload.answers:
+                answers_text = "\n".join([f"{i+1}. {a}" for i, a in enumerate(payload.answers)])
+                context_parts.append(f"Musterantworten zum Fall:\n{answers_text}")
+            
+            # Füge Zusatzinfo hinzu (wenn vorhanden)
+            if payload.extraInfo:
+                context_parts.append(f"Zusatzinformationen zum Fall:\n{payload.extraInfo}")
+            
+            system_prompt += f"\n\nAktueller Fall:\n" + "\n".join(context_parts)
+        messages.append({"role": "system", "content": system_prompt})
+        
+        # Chat-Verlauf hinzufügen (wenn vorhanden)
+        if chat_history:
+            for msg in chat_history:
+                role = msg.get("role", "user")
+                content = msg.get("content", "")
+                # Konvertiere "doctor"/"patient" zu "user" für OpenAI
+                if role in ["doctor", "patient"]:
+                    role = "user"
+                messages.append({"role": role, "content": content})
+        
+        # Aktuelle Frage hinzufügen
+        messages.append({"role": "user", "content": message})
+        
+        # OpenAI aufrufen mit Chat-Verlauf
+        completion = client.chat.completions.create(
+            model=model_name,
+            messages=messages,
+            temperature=1,
+        )
+        reply = completion.choices[0].message.content or ""
+        
         # ✅ FIX: Usage erst NACH erfolgreichem OpenAI-Call
         user.monthly_usage += 1
         db.commit()
@@ -945,6 +1013,28 @@ async def duo_doctor_chat(req: DuoChatRequest, db: Session = Depends(get_db)):
 
     model_name = get_model_for_plan(plan)
 
+    # Baue erweiterten Kontext für Arzt-KI
+    context_parts = [
+        f"Falltitel: {req.caseTitle}",
+        f"Fallbeschreibung (medizinischer Hintergrund - nur für dich):\n{req.caseDescription}"
+    ]
+    
+    # Füge Fragen hinzu (wenn vorhanden)
+    if req.questions:
+        questions_text = "\n".join([f"{i+1}. {q}" for i, q in enumerate(req.questions)])
+        context_parts.append(f"\nFragen zum Fall (nur für dich):\n{questions_text}")
+    
+    # Füge Antworten hinzu (wenn vorhanden)
+    if req.answers:
+        answers_text = "\n".join([f"{i+1}. {a}" for i, a in enumerate(req.answers)])
+        context_parts.append(f"\nMusterantworten zum Fall (nur für dich):\n{answers_text}")
+    
+    # Füge Zusatzinfo hinzu (wenn vorhanden)
+    if req.extraInfo:
+        context_parts.append(f"\nZusatzinformationen zum Fall (nur für dich):\n{req.extraInfo}")
+    
+    context_text = "\n".join(context_parts)
+    
     system_prompt = (
     "Du bist ein erfahrener Neurologe und Lehrarzt.\n"
     "Du siehst den Dialog zwischen einem Patienten und einem Assistenzarzt.\n\n"
@@ -961,8 +1051,7 @@ async def duo_doctor_chat(req: DuoChatRequest, db: Session = Depends(get_db)):
     "- Beispiele: \"Wo genau haben Sie Schmerzen?\" oder \"Können Sie bitte die Pupillenreaktion auf Licht prüfen?\"\n"
     "- Sehr kurz: 1-2 Sätze.\n"
     "- Auf Deutsch.\n\n"
-    f"Falltitel: {req.caseTitle}\n\n"
-    f"Fallbeschreibung (medizinischer Hintergrund - nur für dich):\n{req.caseDescription}\n"
+    f"{context_text}\n"
     )
 
     lines = []
@@ -1068,13 +1157,32 @@ async def validate_diagnosis(payload: DiagnosisValidationPayload, db: Session = 
         convo_lines.append(f"{sprecher}: {msg.content}")
     conversation_text = "\n".join(convo_lines) if convo_lines else "(noch kein Dialog)"
 
+    # Baue erweiterten Kontext für Arzt-KI
+    context_parts = [
+        f"Falltitel: {payload.caseTitle}",
+        f"Fallbeschreibung (Ground Truth - nur für dich):\n{payload.caseDescription}"
+    ]
+    
+    # Füge Fragen hinzu (wenn vorhanden)
+    if payload.questions:
+        questions_text = "\n".join([f"{i+1}. {q}" for i, q in enumerate(payload.questions)])
+        context_parts.append(f"\nFragen zum Fall (nur für dich):\n{questions_text}")
+    
+    # Füge Antworten hinzu (wenn vorhanden)
+    if payload.answers:
+        answers_text = "\n".join([f"{i+1}. {a}" for i, a in enumerate(payload.answers)])
+        context_parts.append(f"\nMusterantworten zum Fall (nur für dich):\n{answers_text}")
+    
+    # Füge Zusatzinfo hinzu (wenn vorhanden)
+    if payload.extraInfo:
+        context_parts.append(f"\nZusatzinformationen zum Fall (nur für dich):\n{payload.extraInfo}")
+    
+    context_text = "\n".join(context_parts)
+    
     prompt = f"""Du bist ein erfahrener Neurologe und Lehrarzt.
 Du prüfst die Diagnose eines Assistenzarztes für einen Fall.
 
-Falltitel: {payload.caseTitle}
-
-Fallbeschreibung (Ground Truth - nur für dich):
-{payload.caseDescription}
+{context_text}
 
 Bisheriger Dialog zwischen Arzt und Patient:
 {conversation_text}
@@ -1082,7 +1190,7 @@ Bisheriger Dialog zwischen Arzt und Patient:
 Vom Arzt gestellte Diagnose: {payload.diagnosis}
 
 AUFGABE:
-1. Prüfe ob die Diagnose korrekt ist (vergliche mit der Fallbeschreibung).
+1. Prüfe ob die Diagnose korrekt ist (vergliche mit der Fallbeschreibung, Fragen, Antworten und Zusatzinformationen).
 2. Wenn falsch: Gib die korrekte Diagnose an und erkläre kurz, warum die gestellte Diagnose falsch ist.
 3. Wenn richtig: Bestätige dies und gib eine kurze Erklärung.
 
@@ -1173,13 +1281,32 @@ async def validate_therapy(payload: TherapyValidationPayload, db: Session = Depe
         convo_lines.append(f"{sprecher}: {msg.content}")
     conversation_text = "\n".join(convo_lines) if convo_lines else "(noch kein Dialog)"
 
+    # Baue erweiterten Kontext für Arzt-KI
+    context_parts = [
+        f"Falltitel: {payload.caseTitle}",
+        f"Fallbeschreibung (Ground Truth - nur für dich):\n{payload.caseDescription}"
+    ]
+    
+    # Füge Fragen hinzu (wenn vorhanden)
+    if payload.questions:
+        questions_text = "\n".join([f"{i+1}. {q}" for i, q in enumerate(payload.questions)])
+        context_parts.append(f"\nFragen zum Fall (nur für dich):\n{questions_text}")
+    
+    # Füge Antworten hinzu (wenn vorhanden)
+    if payload.answers:
+        answers_text = "\n".join([f"{i+1}. {a}" for i, a in enumerate(payload.answers)])
+        context_parts.append(f"\nMusterantworten zum Fall (nur für dich):\n{answers_text}")
+    
+    # Füge Zusatzinfo hinzu (wenn vorhanden)
+    if payload.extraInfo:
+        context_parts.append(f"\nZusatzinformationen zum Fall (nur für dich):\n{payload.extraInfo}")
+    
+    context_text = "\n".join(context_parts)
+    
     prompt = f"""Du bist ein erfahrener Neurologe und Lehrarzt.
 Du prüfst die Therapievorschläge eines Assistenzarztes für einen Fall.
 
-Falltitel: {payload.caseTitle}
-
-Fallbeschreibung (Ground Truth - nur für dich):
-{payload.caseDescription}
+{context_text}
 
 Bisheriger Dialog zwischen Arzt und Patient:
 {conversation_text}
@@ -1189,7 +1316,7 @@ Diagnose: {payload.diagnosis}
 Vom Arzt vorgeschlagene Therapie: {payload.therapy}
 
 AUFGABE:
-1. Prüfe ob die Therapie für die gegebene Diagnose angemessen ist.
+1. Prüfe ob die Therapie für die gegebene Diagnose angemessen ist (berücksichtige Fallbeschreibung, Fragen, Antworten und Zusatzinformationen).
 2. Wenn unpassend: Gib eine bessere Therapie an und erkläre kurz, warum die vorgeschlagene Therapie nicht optimal ist.
 3. Wenn passend: Bestätige dies und gib eine kurze Erklärung.
 
@@ -1310,6 +1437,13 @@ async def duo_session_join(payload: DuoSessionJoinPayload, db: Session = Depends
 
     if s.expires_at < datetime.utcnow():
         raise HTTPException(status_code=410, detail="Session ist abgelaufen")
+
+    # ✅ WICHTIG: Prüfe ob der Fall übereinstimmt
+    if s.case_title and s.case_title != payload.caseTitle:
+        raise HTTPException(
+            status_code=400, 
+            detail=f"Fall stimmt nicht überein! Die Session ist für Fall '{s.case_title}', du versuchst mit Fall '{payload.caseTitle}' beizutreten."
+        )
 
     # ✅ nur 1 doctor pro session
     if s.doctor_user_id and s.doctor_user_id != payload.userId:

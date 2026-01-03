@@ -286,6 +286,41 @@ class QuickAnswersResponse(BaseModel):
     limit: Optional[int] = None
 
 
+class DiagnosisValidationPayload(BaseModel):
+    userId: str
+    caseTitle: str
+    caseDescription: str
+    diagnosis: str
+    history: List[DuoMessage]  # Bisheriger Dialog
+
+
+class DiagnosisValidationResponse(BaseModel):
+    isCorrect: bool
+    feedback: str
+    correctDiagnosis: Optional[str] = None
+    explanation: Optional[str] = None
+    usage: Optional[int] = None
+    limit: Optional[int] = None
+
+
+class TherapyValidationPayload(BaseModel):
+    userId: str
+    caseTitle: str
+    caseDescription: str
+    diagnosis: str  # Die (korrekte) Diagnose
+    therapy: str
+    history: List[DuoMessage]  # Bisheriger Dialog
+
+
+class TherapyValidationResponse(BaseModel):
+    isCorrect: bool
+    feedback: str
+    correctTherapy: Optional[str] = None
+    explanation: Optional[str] = None
+    usage: Optional[int] = None
+    limit: Optional[int] = None
+
+
 # -------------------------------------------------------
 # Helper für Apple Public Key (mit Caching)
 # -------------------------------------------------------
@@ -448,13 +483,22 @@ def generate_join_code(length: int = 6) -> str:
 def build_coach_prompt(case_title: str, case_description: str, history: List[Dict[str, str]]) -> str:
     system_prompt = (
         "Du bist ein erfahrener Neurologe und Lehrarzt.\n"
-        "Du siehst den Dialog zwischen einem Patienten und einem Assistenzarzt.\n"
-        "Deine Aufgabe ist, knappe, konkrete Vorschlaege zu machen:\n"
-        "- Welche Frage sollte der Arzt als naechstes stellen?\n"
-        "- Welche koerperliche Untersuchung oder Zusatzdiagnostik bietet sich an?\n"
-        "Antworte in 1-3 kurzen Saetzen auf Deutsch, als Vorschlag an den Arzt.\n\n"
+        "Du siehst den Dialog zwischen einem Patienten und einem Assistenzarzt.\n\n"
+        "WICHTIG: Formuliere NUR EINE konkrete Frage, die der Arzt direkt an den Patienten stellen kann.\n"
+        "Nicht mehrere Vorschläge auf einmal. Schritt für Schritt zur Diagnose.\n\n"
+        "Regeln:\n"
+        "- Wenn noch wenig Anamnese: formuliere die nächste wichtige Anamnesefrage in der Ich-Form.\n"
+        "- Wenn Anamnese ausreichend: formuliere eine Untersuchungsanweisung in der Ich-Form.\n"
+        "- Wenn Untersuchung abgeschlossen: schlage die nächste sinnvolle Zusatzdiagnostik vor.\n"
+        "- Baue auf dem bisherigen Dialog auf. Wiederhole nicht bereits gestellte Fragen.\n"
+        "- Führe logisch zur Diagnose hin.\n\n"
+        "Format:\n"
+        "- Formuliere die Frage direkt, die der Arzt stellen soll (nicht \"Fragen Sie...\", sondern direkt die Frage).\n"
+        "- Beispiele: \"Wo genau haben Sie Schmerzen?\" oder \"Können Sie bitte die Pupillenreaktion auf Licht prüfen?\"\n"
+        "- Sehr kurz: 1-2 Sätze.\n"
+        "- Auf Deutsch.\n\n"
         f"Falltitel: {case_title}\n\n"
-        f"Fallbeschreibung (medizinischer Hintergrund):\n{case_description}\n"
+        f"Fallbeschreibung (medizinischer Hintergrund - nur für dich):\n{case_description}\n"
     )
 
     lines = []
@@ -469,7 +513,7 @@ def build_coach_prompt(case_title: str, case_description: str, history: List[Dic
         system_prompt
         + "\n\nBisheriger Dialog:\n"
         + conversation_text
-        + "\n\nDein naechster Vorschlag an den Arzt:"
+        + "\n\nFormuliere NUR EINE konkrete Frage, die der Arzt direkt an den Patienten stellen kann (1-2 Sätze, direkt formuliert, nicht \"Fragen Sie...\"):"
     )
 
 
@@ -904,19 +948,21 @@ async def duo_doctor_chat(req: DuoChatRequest, db: Session = Depends(get_db)):
     system_prompt = (
     "Du bist ein erfahrener Neurologe und Lehrarzt.\n"
     "Du siehst den Dialog zwischen einem Patienten und einem Assistenzarzt.\n\n"
-    "Deine Aufgabe: Gib dem Arzt sehr knappe, sofort umsetzbare Vorschläge.\n"
-    "Sprich ihn direkt an (\"Fragen Sie ...\", \"Untersuchen Sie ...\").\n\n"
+    "WICHTIG: Formuliere NUR EINE konkrete Frage, die der Arzt direkt an den Patienten stellen kann.\n"
+    "Nicht mehrere Vorschläge auf einmal. Schritt für Schritt zur Diagnose.\n\n"
     "Regeln:\n"
-    "- Schreibe auf Deutsch.\n"
-    "- Kurz und klar: 1–3 Sätze.\n"
-    "- Keine langen Erklärungen, keine Lehrbuchtexte.\n"
-    "- Wenn du etwas vorschlägst, nenne möglichst genau, was er fragen/prüfen soll.\n\n"
-    "Was du liefern sollst:\n"
-    "- Nächste sinnvolle Frage an den Patienten.\n"
-    "- Nächster sinnvoller Untersuchungsschritt (körperlich).\n"
-    "- Optional: eine passende Zusatzdiagnostik (nur wenn wirklich naheliegend).\n\n"
+    "- Wenn noch wenig Anamnese: formuliere die nächste wichtige Anamnesefrage in der Ich-Form.\n"
+    "- Wenn Anamnese ausreichend: formuliere eine Untersuchungsanweisung in der Ich-Form.\n"
+    "- Wenn Untersuchung abgeschlossen: schlage die nächste sinnvolle Zusatzdiagnostik vor.\n"
+    "- Baue auf dem bisherigen Dialog auf. Wiederhole nicht bereits gestellte Fragen.\n"
+    "- Führe logisch zur Diagnose hin.\n\n"
+    "Format:\n"
+    "- Formuliere die Frage direkt, die der Arzt stellen soll (nicht \"Fragen Sie...\", sondern direkt die Frage).\n"
+    "- Beispiele: \"Wo genau haben Sie Schmerzen?\" oder \"Können Sie bitte die Pupillenreaktion auf Licht prüfen?\"\n"
+    "- Sehr kurz: 1-2 Sätze.\n"
+    "- Auf Deutsch.\n\n"
     f"Falltitel: {req.caseTitle}\n\n"
-    f"Fallbeschreibung (medizinischer Hintergrund):\n{req.caseDescription}\n"
+    f"Fallbeschreibung (medizinischer Hintergrund - nur für dich):\n{req.caseDescription}\n"
     )
 
     lines = []
@@ -931,7 +977,7 @@ async def duo_doctor_chat(req: DuoChatRequest, db: Session = Depends(get_db)):
         system_prompt
         + "\n\nBisheriger Dialog:\n"
         + conversation_text
-        + "\n\nDein naechster Vorschlag an den Arzt:"
+        + "\n\nFormuliere NUR EINE konkrete Frage, die der Arzt direkt an den Patienten stellen kann (1-2 Sätze, direkt formuliert, nicht \"Fragen Sie...\"):"
     )
 
     try:
@@ -998,6 +1044,218 @@ async def duo_quickanswers_create(payload: QuickAnswersCreatePayload, db: Sessio
     ws_manager.quickanswers[payload.sessionId] = items
 
     return QuickAnswersResponse(sessionId=payload.sessionId, items=items, usage=user.monthly_usage, limit=limit)
+
+
+# -------------------------------------------------------
+# NEW: Diagnose-Validierung
+# -------------------------------------------------------
+@app.post("/duo/validate-diagnosis", response_model=DiagnosisValidationResponse)
+async def validate_diagnosis(payload: DiagnosisValidationPayload, db: Session = Depends(get_db)):
+    user = get_or_create_user(db, payload.userId)
+    apply_month_reset(user)
+
+    plan = user.plan
+    limit = get_limit_for_plan(plan)
+    if user.monthly_usage >= limit:
+        raise HTTPException(status_code=403, detail="Limit erreicht")
+
+    model_name = get_model_for_plan(plan)
+
+    # Dialog-History formatieren
+    convo_lines = []
+    for msg in payload.history:
+        sprecher = "Arzt" if msg.role == "doctor" else "Patient"
+        convo_lines.append(f"{sprecher}: {msg.content}")
+    conversation_text = "\n".join(convo_lines) if convo_lines else "(noch kein Dialog)"
+
+    prompt = f"""Du bist ein erfahrener Neurologe und Lehrarzt.
+Du prüfst die Diagnose eines Assistenzarztes für einen Fall.
+
+Falltitel: {payload.caseTitle}
+
+Fallbeschreibung (Ground Truth - nur für dich):
+{payload.caseDescription}
+
+Bisheriger Dialog zwischen Arzt und Patient:
+{conversation_text}
+
+Vom Arzt gestellte Diagnose: {payload.diagnosis}
+
+AUFGABE:
+1. Prüfe ob die Diagnose korrekt ist (vergliche mit der Fallbeschreibung).
+2. Wenn falsch: Gib die korrekte Diagnose an und erkläre kurz, warum die gestellte Diagnose falsch ist.
+3. Wenn richtig: Bestätige dies und gib eine kurze Erklärung.
+
+Antworte NUR mit gültigem JSON (ohne Text drumherum):
+{{
+  "isCorrect": true/false,
+  "feedback": "Kurze Rückmeldung (1-2 Sätze)",
+  "correctDiagnosis": "Korrekte Diagnose (nur wenn falsch)",
+  "explanation": "Kurze Erklärung warum richtig/falsch (2-3 Sätze)"
+}}
+"""
+
+    try:
+        reply_text = call_openai(prompt, model_name=model_name).strip()
+        
+        # JSON aus Antwort extrahieren
+        data = None
+        try:
+            data = json.loads(reply_text)
+        except Exception:
+            # Best-effort JSON extrahieren
+            start = reply_text.find("{")
+            end = reply_text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                try:
+                    data = json.loads(reply_text[start:end + 1])
+                except Exception:
+                    data = None
+
+        if not data or not isinstance(data, dict):
+            # Fallback wenn JSON-Parsing fehlschlägt
+            return DiagnosisValidationResponse(
+                isCorrect=False,
+                feedback="Technischer Fehler bei der Validierung. Bitte versuche es erneut.",
+                usage=user.monthly_usage,
+                limit=limit
+            )
+
+        is_correct = bool(data.get("isCorrect", False))
+        feedback = str(data.get("feedback", "Validierung abgeschlossen."))
+        correct_diagnosis = data.get("correctDiagnosis")
+        explanation = data.get("explanation")
+
+        # ✅ FIX: Usage erst NACH erfolgreichem OpenAI-Call
+        user.monthly_usage += 1
+        db.commit()
+        db.refresh(user)
+
+        return DiagnosisValidationResponse(
+            isCorrect=is_correct,
+            feedback=feedback,
+            correctDiagnosis=correct_diagnosis,
+            explanation=explanation,
+            usage=user.monthly_usage,
+            limit=limit
+        )
+
+    except Exception as e:
+        db.rollback()  # ✅ FIX: Rollback bei Fehler
+        print("Fehler in /duo/validate-diagnosis:", repr(e))
+        return DiagnosisValidationResponse(
+            isCorrect=False,
+            feedback=f"Technischer Fehler: {str(e)}",
+            usage=user.monthly_usage,
+            limit=limit
+        )
+
+
+# -------------------------------------------------------
+# NEW: Therapie-Validierung
+# -------------------------------------------------------
+@app.post("/duo/validate-therapy", response_model=TherapyValidationResponse)
+async def validate_therapy(payload: TherapyValidationPayload, db: Session = Depends(get_db)):
+    user = get_or_create_user(db, payload.userId)
+    apply_month_reset(user)
+
+    plan = user.plan
+    limit = get_limit_for_plan(plan)
+    if user.monthly_usage >= limit:
+        raise HTTPException(status_code=403, detail="Limit erreicht")
+
+    model_name = get_model_for_plan(plan)
+
+    # Dialog-History formatieren
+    convo_lines = []
+    for msg in payload.history:
+        sprecher = "Arzt" if msg.role == "doctor" else "Patient"
+        convo_lines.append(f"{sprecher}: {msg.content}")
+    conversation_text = "\n".join(convo_lines) if convo_lines else "(noch kein Dialog)"
+
+    prompt = f"""Du bist ein erfahrener Neurologe und Lehrarzt.
+Du prüfst die Therapievorschläge eines Assistenzarztes für einen Fall.
+
+Falltitel: {payload.caseTitle}
+
+Fallbeschreibung (Ground Truth - nur für dich):
+{payload.caseDescription}
+
+Bisheriger Dialog zwischen Arzt und Patient:
+{conversation_text}
+
+Diagnose: {payload.diagnosis}
+
+Vom Arzt vorgeschlagene Therapie: {payload.therapy}
+
+AUFGABE:
+1. Prüfe ob die Therapie für die gegebene Diagnose angemessen ist.
+2. Wenn unpassend: Gib eine bessere Therapie an und erkläre kurz, warum die vorgeschlagene Therapie nicht optimal ist.
+3. Wenn passend: Bestätige dies und gib eine kurze Erklärung.
+
+Antworte NUR mit gültigem JSON (ohne Text drumherum):
+{{
+  "isCorrect": true/false,
+  "feedback": "Kurze Rückmeldung (1-2 Sätze)",
+  "correctTherapy": "Bessere Therapie (nur wenn unpassend)",
+  "explanation": "Kurze Erklärung warum passend/unpassend (2-3 Sätze)"
+}}
+"""
+
+    try:
+        reply_text = call_openai(prompt, model_name=model_name).strip()
+        
+        # JSON aus Antwort extrahieren
+        data = None
+        try:
+            data = json.loads(reply_text)
+        except Exception:
+            # Best-effort JSON extrahieren
+            start = reply_text.find("{")
+            end = reply_text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                try:
+                    data = json.loads(reply_text[start:end + 1])
+                except Exception:
+                    data = None
+
+        if not data or not isinstance(data, dict):
+            # Fallback wenn JSON-Parsing fehlschlägt
+            return TherapyValidationResponse(
+                isCorrect=False,
+                feedback="Technischer Fehler bei der Validierung. Bitte versuche es erneut.",
+                usage=user.monthly_usage,
+                limit=limit
+            )
+
+        is_correct = bool(data.get("isCorrect", False))
+        feedback = str(data.get("feedback", "Validierung abgeschlossen."))
+        correct_therapy = data.get("correctTherapy")
+        explanation = data.get("explanation")
+
+        # ✅ FIX: Usage erst NACH erfolgreichem OpenAI-Call
+        user.monthly_usage += 1
+        db.commit()
+        db.refresh(user)
+
+        return TherapyValidationResponse(
+            isCorrect=is_correct,
+            feedback=feedback,
+            correctTherapy=correct_therapy,
+            explanation=explanation,
+            usage=user.monthly_usage,
+            limit=limit
+        )
+
+    except Exception as e:
+        db.rollback()  # ✅ FIX: Rollback bei Fehler
+        print("Fehler in /duo/validate-therapy:", repr(e))
+        return TherapyValidationResponse(
+            isCorrect=False,
+            feedback=f"Technischer Fehler: {str(e)}",
+            usage=user.monthly_usage,
+            limit=limit
+        )
 
 
 # -------------------------------------------------------

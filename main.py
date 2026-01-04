@@ -460,7 +460,7 @@ def generate_role_description(case_title: str, case_description: str, model_name
     completion = client.chat.completions.create(
         model=model_name,
         messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
+        # ✅ FIX: Kein temperature Parameter - verwendet Default (1), da manche Modelle nur Default unterstützen
     )
     
     return (completion.choices[0].message.content or "").strip()
@@ -1828,5 +1828,6 @@ async def ws_duo(session_id: str, websocket: WebSocket):
         except Exception:
             pass
         db.close()
+
 
 

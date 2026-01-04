@@ -294,6 +294,7 @@ class QuickAnswersCreatePayload(BaseModel):
 class QuickAnswersResponse(BaseModel):
     sessionId: str
     items: List[Dict[str, str]]
+    roleDescription: Optional[str] = None  # Rollenbeschreibung in Ich-Form
     usage: Optional[int] = None
     limit: Optional[int] = None
 
@@ -368,10 +369,14 @@ def get_apple_public_key(kid: str):
 class WSManager:
     def __init__(self):
         self.quickanswers: Dict[str, List[Dict[str, str]]] = {}
+        self.role_descriptions: Dict[str, str] = {}  # ✅ NEU: Cache für Rollenbeschreibungen
         # session_id -> {"doctor": set(ws), "patient": set(ws)}
         self.sessions: Dict[str, Dict[str, set[WebSocket]]] = {}
         # session_id -> history list[{"role": "...", "content": "..."}]
         self.history: Dict[str, List[Dict[str, str]]] = {}
+        # ✅ NEU: Rate-Limiting für Patient-Nachrichten
+        self.patient_message_count: Dict[str, int] = {}  # session_id -> Anzahl Nachrichten hintereinander
+        self.patient_ai_processing: Dict[str, bool] = {}  # session_id -> ob KI-Antwort läuft
 
     async def connect(self, session_id: str, role: str, websocket: WebSocket):
         # ✅ WICHTIG: KEIN websocket.accept() hier!
@@ -420,6 +425,46 @@ TYPICAL_QUESTIONS: list[str] = [
     "Allergien?",
     "Rauchen/Alkohol/Drogen/Sport?",
 ]
+
+def build_role_description_prompt(case_title: str, case_description: str) -> str:
+    """Generiert eine Rollenbeschreibung in Ich-Form für den Patienten."""
+    return f"""
+Du bist der PATIENT in einem neurologischen Trainingsfall.
+Deine Aufgabe ist es, eine kurze Rollenbeschreibung in Ich-Form zu erstellen, die dem Patienten hilft, sich in seine Rolle hineinzuversetzen.
+
+REGELN:
+- Schreibe in Ich-Form (z.B. "Ich bin ein 45-jähriger Mann...")
+- Nutze AUSSCHLIESSLICH Informationen aus dem Falltext
+- Erfinde nichts dazu
+- Kurz und prägnant: 3-5 Sätze
+- Alltagssprache, keine Fachbegriffe
+- Fokus auf die wichtigsten Symptome und Umstände
+
+FALL:
+Titel: {case_title}
+
+Fallbeschreibung (Ground Truth):
+{case_description}
+
+AUFGABE:
+Erstelle eine kurze Rollenbeschreibung in Ich-Form, die dem Patienten hilft, sich in seine Rolle hineinzuversetzen.
+
+Antworte NUR mit dem Text der Rollenbeschreibung (ohne zusätzliche Erklärungen oder Formatierung).
+""".strip()
+
+
+def generate_role_description(case_title: str, case_description: str, model_name: str) -> str:
+    """Generiert eine Rollenbeschreibung für den Patienten."""
+    prompt = build_role_description_prompt(case_title, case_description)
+    
+    completion = client.chat.completions.create(
+        model=model_name,
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.7,
+    )
+    
+    return (completion.choices[0].message.content or "").strip()
+
 
 def build_quickanswers_prompt(case_title: str, case_description: str, questions: List[str]) -> str:
     q_lines = "\n".join([f"- {q}" for q in questions])
@@ -1103,11 +1148,18 @@ async def duo_quickanswers_create(payload: QuickAnswersCreatePayload, db: Sessio
 
     # ✅ Cache: wenn schon da, direkt zurück (ohne neues Usage)
     cached = ws_manager.quickanswers.get(payload.sessionId)
+    cached_role_desc = ws_manager.role_descriptions.get(payload.sessionId)  # ✅ NEU: Role Description Cache
     if cached and len(cached) > 0:
         user = get_or_create_user(db, payload.userId)
         apply_month_reset(user)
         limit = get_limit_for_plan(user.plan)
-        return QuickAnswersResponse(sessionId=payload.sessionId, items=cached, usage=user.monthly_usage, limit=limit)
+        return QuickAnswersResponse(
+            sessionId=payload.sessionId, 
+            items=cached, 
+            roleDescription=cached_role_desc,  # ✅ NEU: Role Description zurückgeben
+            usage=user.monthly_usage, 
+            limit=limit
+        )
 
     user = get_or_create_user(db, payload.userId)
     apply_month_reset(user)
@@ -1120,8 +1172,11 @@ async def duo_quickanswers_create(payload: QuickAnswersCreatePayload, db: Sessio
     model_name = get_model_for_plan(plan)
 
     try:
+        # ✅ NEU: Generiere sowohl Rollenbeschreibung als auch Quick-Answers
+        role_desc = generate_role_description(s.case_title, s.case_description, model_name=model_name)
         items = generate_quickanswers(s.case_title, s.case_description, model_name=model_name)
-        # ✅ FIX: Usage erst NACH erfolgreichem OpenAI-Call
+        
+        # ✅ FIX: Usage erst NACH erfolgreichem OpenAI-Call (beide Calls zählen als 1)
         user.monthly_usage += 1
         db.commit()
         db.refresh(user)
@@ -1131,8 +1186,15 @@ async def duo_quickanswers_create(payload: QuickAnswersCreatePayload, db: Sessio
 
     # ✅ Cache speichern
     ws_manager.quickanswers[payload.sessionId] = items
+    ws_manager.role_descriptions[payload.sessionId] = role_desc  # ✅ NEU: Role Description Cache
 
-    return QuickAnswersResponse(sessionId=payload.sessionId, items=items, usage=user.monthly_usage, limit=limit)
+    return QuickAnswersResponse(
+        sessionId=payload.sessionId, 
+        items=items, 
+        roleDescription=role_desc,  # ✅ NEU: Role Description zurückgeben
+        usage=user.monthly_usage, 
+        limit=limit
+    )
 
 
 # -------------------------------------------------------
@@ -1552,10 +1614,12 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                     continue
 
                 cached = ws_manager.quickanswers.get(session_id)
+                cached_role_desc = ws_manager.role_descriptions.get(session_id)  # ✅ NEU: Role Description Cache
                 if cached and not force:
                     await websocket.send_text(json.dumps({
                         "type": "quick_answers",
-                        "items": cached
+                        "items": cached,
+                        "roleDescription": cached_role_desc  # ✅ NEU: Role Description mitsenden
                     }, ensure_ascii=False))
                     print(f"[WS] quick_answers cache-hit session={session_id} items={len(cached)}")
                     continue
@@ -1576,12 +1640,14 @@ async def ws_duo(session_id: str, websocket: WebSocket):
 
                 try:
                     model_name = get_model_for_plan(plan)
+                    # ✅ NEU: Generiere sowohl Rollenbeschreibung als auch Quick-Answers
+                    role_desc = generate_role_description(s.case_title, s.case_description, model_name=model_name)
                     items = generate_quickanswers(
                         case_title=s.case_title,
                         case_description=s.case_description,
                         model_name=model_name
                     )
-                    # ✅ FIX: Usage erst NACH erfolgreichem OpenAI-Call
+                    # ✅ FIX: Usage erst NACH erfolgreichem OpenAI-Call (beide Calls zählen als 1)
                     user.monthly_usage += 1
                     db.commit()
                     db.refresh(user)
@@ -1595,12 +1661,17 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                     }, ensure_ascii=False))
                     continue
 
+                # ✅ NEU: Generiere Rollenbeschreibung
+                role_desc = generate_role_description(s.case_title, s.case_description, model_name=model_name)
+                
                 ws_manager.quickanswers[session_id] = items
+                ws_manager.role_descriptions[session_id] = role_desc  # ✅ NEU: Role Description Cache
                 print(f"[WS] quick_answers generated session={session_id} items={len(items)} usage={user.monthly_usage}/{limit}")
 
                 await websocket.send_text(json.dumps({
                     "type": "quick_answers",
                     "items": items,
+                    "roleDescription": role_desc,  # ✅ NEU: Role Description mitsenden
                     "usage": user.monthly_usage,
                     "limit": limit
                 }, ensure_ascii=False))
@@ -1683,11 +1754,27 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                 text = (data.get("text") or "").strip()
                 if not text:
                     continue
-
+                     
                 ws_manager.history.setdefault(session_id, [])
                 ws_manager.history[session_id].append({"role": "doctor", "content": text})
-
+                
+                # ✅ NEU: Rate-Limiting zurücksetzen wenn Arzt eine Nachricht sendet
+                ws_manager.patient_message_count[session_id] = 0
+                        
                 await ws_manager.broadcast(session_id, "patient", {"type": "doctor_text", "text": text})
+                continue
+
+            # =========================
+            # ✅ KI-Antwort Status (Patient signalisiert Start/Ende)
+            # =========================
+            if msg_type == "ai_reply_start" and role == "patient":
+                ws_manager.patient_ai_processing[session_id] = True
+                print(f"[WS] ai_reply_start session={session_id}")
+                continue
+                
+            if msg_type == "ai_reply_end" and role == "patient":
+                ws_manager.patient_ai_processing[session_id] = False
+                print(f"[WS] ai_reply_end session={session_id}")
                 continue
 
             # =========================
@@ -1697,6 +1784,26 @@ async def ws_duo(session_id: str, websocket: WebSocket):
                 text = (data.get("text") or "").strip()
                 if not text:
                     continue
+                
+                # ✅ NEU: Rate-Limiting - Prüfe ob KI-Antwort läuft
+                if ws_manager.patient_ai_processing.get(session_id, False):
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "Bitte warte, bis die KI-Antwort abgeschlossen ist."
+                    }, ensure_ascii=False))
+                    continue
+                
+                # ✅ NEU: Rate-Limiting - Prüfe ob mehr als 3 Nachrichten hintereinander
+                count = ws_manager.patient_message_count.get(session_id, 0)
+                if count >= 3:
+                    await websocket.send_text(json.dumps({
+                        "type": "error",
+                        "message": "Du hast bereits 3 Nachrichten hintereinander gesendet. Bitte warte auf eine Antwort vom Arzt."
+                    }, ensure_ascii=False))
+                    continue
+                
+                # ✅ NEU: Nachricht zählen
+                ws_manager.patient_message_count[session_id] = count + 1
                      
                 ws_manager.history.setdefault(session_id, [])
                 ws_manager.history[session_id].append({"role": "patient", "content": text})
